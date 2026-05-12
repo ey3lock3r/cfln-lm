@@ -18,6 +18,8 @@ from cfln.modules.si import SynapticIntelligence, ExemplarDormancyBuffer, Domain
 from cfln.modules.dynamic_bank import DynamicLocalBank
 from cfln.modules.uncertainty import CFLNPathologyMonitor
 from cfln.modules.monitoring import SlowDriftDetector
+from cfln.modules.v9_ops import consolidate_arc_to_cnep, micro_consolidate_arc  # noqa: F401 — used in reset_for_inference/_update_telescoping
+from cfln.modules.telescoping import vq_telescope_update, vq_telescope_retrieve  # noqa: F401 — added in Step 6
 
 
 class CFLNModel(nn.Module):
@@ -47,10 +49,16 @@ class CFLNModel(nn.Module):
             d_r_node=cfg.get('d_r_node',8),
             rho_node=cfg.get('rho_node',0.95),
             n_heads_gat=cfg.get('n_heads_gat',4),
+            K_L1=cfg.get('K_L1',128), K_L2=cfg.get('K_L2',32), K_L3=cfg.get('K_L3',32),
+            C_chunk=cfg.get('C_chunk',32), n_roles=cfg.get('n_roles',8),
             # v5.9.6 I5: multi-scale rho kwargs
             rho_fast=cfg.get('rho_fast',0.70),
             rho_mid=cfg.get('rho_mid',0.90),
             rho_slow=cfg.get('rho_slow',0.99))
+        # §1.64 C2 / §1.70 C7: per-bank hyperparams set from cfg
+        self.bank.k_l_min = cfg.get('k_l_min', 10)
+        self.bank.k_l_max = cfg.get('k_l_max', 40)
+        self.bank.tau_proto_min = cfg.get('tau_proto_min', 0.4)
         L=cfg.get('L',6); self.lam_p_schedule=PerLayerLamPSchedule(L=L)
         self.cfl_layers=nn.ModuleList([
             CFL5Layer(self.bank,l,self.lam_p_schedule)
@@ -64,9 +72,7 @@ class CFLNModel(nn.Module):
             d_c=d_c,K_L1=cfg.get('K_L1',128),K_L2=cfg.get('K_L2',32),
             K_L3=cfg.get('K_L3',32),C_chunk=cfg.get('C_chunk',32),
             beta=cfg.get('beta_telescoping',1.0))
-        self.W_compress_L1=nn.Parameter(torch.eye(d_c,dtype=torch.cfloat))
-        self.W_compress_L2=nn.Parameter(torch.eye(d_c,dtype=torch.cfloat))
-        self.W_compress_L3=nn.Parameter(torch.eye(d_c,dtype=torch.cfloat))
+        # §1.59 VQ-Telescope: W_compress_L1/L2/L3 removed; replaced by VQ routing weight vectors on bank
         self.surprise_archive=SurpriseArchive(
             d_c=d_c,N_archive=cfg.get('N_archive',256),N_tau=cfg.get('surprise_N_tau',100),
             W_warmup=cfg.get('surprise_warmup_chunks',32),tau_percentile=cfg.get('surprise_threshold_pct',0.80))
@@ -74,13 +80,11 @@ class CFLNModel(nn.Module):
         self.w_outer_gate=nn.Parameter(torch.zeros(2*d_c))
         self._L_compress_accum=None
 
-        # RC Bridge (v5.9.6 I4 / v5.9.7 C3): FIXED random buffer (ESN design)
-        # W_rc_bridge was nn.Parameter in v5.9.6 but received zero gradient (inside no_grad block).
-        # Same problem as W_ri/W_enc_res pre-v5.9.5. Fixed: register_buffer like W_ri and W_enc_res.
+        # §1.50: W_rc_bridge changed from register_buffer to nn.Parameter (trained via L_bridge)
         d_r_node_=cfg.get('d_r_node',8); d_r_lista_=cfg.get('d_r_lista',None) or d_c//2
         W_bridge_init=((torch.randn(d_r_lista_,d_r_node_)+1j*torch.randn(d_r_lista_,d_r_node_)
                        ).to(torch.cfloat)/d_r_node_**0.5)
-        self.register_buffer('W_rc_bridge',W_bridge_init)          # (d_r_lista, d_r_node) FIXED
+        self.W_rc_bridge = nn.Parameter(W_bridge_init)              # (d_r_lista, d_r_node) TRAINED
 
         # DiffusionAuxiliaryModule with RC params (v5.9.4)
         self.diff_aux=DiffusionAuxiliaryModule(
@@ -92,7 +96,7 @@ class CFLNModel(nn.Module):
             d_r_lista=cfg.get('d_r_lista',None),
             rho_lista=cfg.get('rho_lista',0.99),
             sparse_code_cache_K=cfg.get('sparse_code_cache_K',32),   # v5.9.8
-            episodic_rule_n=cfg.get('episodic_rule_cache_n',64),
+            episodic_rule_n=cfg.get('episodic_rule_cache_n', cfg.get('N_rules', 256)),
             lista_min_ratio=cfg.get('lista_min_ratio',0.25),
             lista_convergence_ratio=cfg.get('lista_convergence_ratio',0.5))
         self.refine=IterativeRefinementModule(
@@ -102,6 +106,7 @@ class CFLNModel(nn.Module):
             use_hopfield_coupling=cfg.get('use_hopfield_refine',True),
             use_escape=cfg.get('use_escape_refine',True))
         self.diff_aux.cun.init_S_from_unitaries()
+        self.diff_aux.cun.beam_B_max = cfg.get('beam_B_max', 3)  # §1.66: adaptive beam width
 
         self.si          =SynapticIntelligence(cfg.get('c_SI',0.5),cfg.get('rho_SI',0.999),cfg.get('beta_SI',3.0))
         self.dormancy_buf=ExemplarDormancyBuffer(
@@ -126,6 +131,8 @@ class CFLNModel(nn.Module):
         self._in_thinking_mode: bool = False   # gates Titans/Telescoping/SurpriseArchive/CL.A
         for l,layer in enumerate(self.cfl_layers): layer._lam_p_correction=1.0
         _=self.si._get_named_params(self)
+        self.cfg = cfg  # keep for v9.0 helpers (micro_consolidate_arc, etc.)
+        self._archive_loaded = False  # §1.38 Y3: guard for cross-session archive load
 
     def setup_device(self,device: torch.device) -> 'CFLNModel':
         """Move non-Module components to device. CALL AFTER model.to(device)."""
@@ -134,12 +141,12 @@ class CFLNModel(nn.Module):
         self.surprise_archive.to(device)
         return self
 
-    def expand_vocabulary(self, n_new: int=2) -> None:
-        """v6.0 CTP / v6.0.1 H1+M8: Expand vocabulary by n_new tokens.
-        Default n_new=2: <think> (index V), </think> (index V+1).
+    def expand_vocabulary(self, n_new: int=6) -> None:
+        """v9.0: Expand vocabulary by n_new tokens (default 6).
+        base+0: <think>, base+1: </think>, base+2: <hypo>, base+3: </hypo>,
+        base+4: <push_goal>, base+5: </push_goal>  (§1.32 R3 + §1.39 Z)
         Extends embed_real, embed_imag, W_vocab.weight, W_vocab.bias.
-        Raises ValueError if called more than once (guard against double-expansion).
-        Safe to call on pretrained checkpoints. New rows initialised N(0,0.02).
+        Raises ValueError if called more than once.
         """
         # v6.0.1 M8: guard against double-expansion
         if self.THINK_START_ID >= 0:
@@ -178,6 +185,12 @@ class CFLNModel(nn.Module):
         # old_vocab captured BEFORE expansion block — safe and unambiguous
         self.THINK_START_ID=old_vocab       # <think>
         self.THINK_END_ID  =old_vocab+1     # </think>
+        # §1.32 R3: HYPO tokens
+        self.register_buffer('_hypo_start_id', torch.tensor(old_vocab+2, dtype=torch.long))
+        self.register_buffer('_hypo_end_id',   torch.tensor(old_vocab+3, dtype=torch.long))
+        # §1.39 Z: SSP tokens
+        self.register_buffer('_push_goal_id',  torch.tensor(old_vocab+4, dtype=torch.long))
+        self.register_buffer('_pop_goal_id',   torch.tensor(old_vocab+5, dtype=torch.long))
 
     # ── v6.0.4 C1: properties for backward-compatible THINK_ID access ─────────
     @property
@@ -198,20 +211,29 @@ class CFLNModel(nn.Module):
 
     def reset_for_inference(self) -> None:
         """Reset all session state including both reservoirs."""
+        # §1.37 Y2: consolidate ARC rules → μ_c_l BEFORE clearing session state
+        consolidate_arc_to_cnep(self.bank, self.diff_aux.cun,
+                                tau_consol=self.cfg.get('tau_consol', 3.0),
+                                alpha_consol=self.cfg.get('alpha_consol', 0.001))
+        # §1.38 Y3: persist SurpriseArchive (optional)
+        if self.cfg.get('persist_archive', False):
+            self.surprise_archive.save_state(self.cfg.get('archive_path', 'archive.pt'))
+        if self.cfg.get('persist_archive', False) and not self._archive_loaded:
+            self.surprise_archive.load_state(self.cfg.get('archive_path', 'archive.pt'))
+            self._archive_loaded = True
+
         self.encoder.reset_for_inference()
         self.telescoping_mem.reset()
         self.surprise_archive.reset()
         self.sti_head.reset()
         self._pos_offset=0
-        self.bank.reset_reservoir()                          # node reservoir
-        self.bank._last_salience=1.0                          # v5.9.6: reset salience gate
-        self.diff_aux.cun.reset_lista_reservoir()            # LISTA reservoir (also resets cun._in_thinking_mode)
+        self.bank.reset_reservoir()                          # node reservoir (also clears g_c and HYPO state)
+        self.bank._last_salience=1.0
+        self.diff_aux.cun.reset_lista_reservoir()            # LISTA reservoir (clears SSP stack, precision, etc.)
         self._in_thinking_mode=False
-        self._x_c_prev=None          # v6.0.7 MC-3: U_temporal prev representation
-        # Note: bank._u_epi_mu/_u_epi_var deliberately NOT reset — they are global
-        # calibration stats that warm-start gracefully across domain changes (v6.0.9 design)
+        self._x_c_prev=None
+        # Note: bank._u_epi_mu/_u_epi_var deliberately NOT reset — global calibration stats
         self._ema_delta=0.0          # v6.0.7 MC-3: running mean of δ_t
-        self._log_w_rec=[0.0,0.0,0.0,0.0]  # v6.0.7 MC-2: session recency weights                          # v6.0 CTP: exit thinking mode
         if hasattr(self.encoder,'titans'): self.encoder.titans._in_thinking_mode=False
 
     def _compute_field_stats(self,info_t_list,K,device):
@@ -229,35 +251,91 @@ class CFLNModel(nn.Module):
             else: out.append(torch.zeros(B,2*K+1,device=device))
         return torch.stack(out,dim=1)
 
-    def _compress_chunk_L1(self,x): return self.W_compress_L1@x.mean(dim=(0,1))
-    def _compress_L2(self,c1): return self.W_compress_L2@c1
-    def _compress_L3(self,c2): return self.W_compress_L3@c2
+    def _retrieve_all_memory(self, x_c_query):
+        x_rm = to_real(x_c_query.mean(0))
+        gates = torch.sigmoid(self.W_gate_mem @ x_rm)
+        # §1.59 VQ-Telescope: retrieve via routing weight space if bank has VQ buffers
+        bank = self.bank
+        if hasattr(bank, 'buf_L1_w_full') and bank._L1_ptr > 0:
+            # §1.59 OI-7: use cached last routing weight vector as query (was always zeros)
+            _cached = getattr(bank, '_last_s_l_full', None)
+            if _cached is not None:
+                s_l_full_q = _cached.to(x_c_query.device)
+            else:
+                s_l_full_q = torch.zeros(bank.N_max_l, dtype=torch.float32, device=x_c_query.device)
+            r_L1, r_L2, r_L3 = vq_telescope_retrieve(s_l_full_q, bank)
+        else:
+            r_L1, r_L2, r_L3 = self.telescoping_mem.retrieve_all(x_c_query)
+        r_arch = self.surprise_archive.retrieve(x_c_query)
+        r_comb = gates[0]*r_L1 + gates[1]*r_L2 + gates[2]*r_L3 + gates[3]*r_arch
+        return torch.sigmoid(self.w_outer_gate @ x_rm) * r_comb
 
-    def _retrieve_all_memory(self,x_c_query):
-        x_rm=to_real(x_c_query.mean(0))
-        gates=torch.sigmoid(self.W_gate_mem@x_rm)  # v5.9.6 I3: independent sigmoid (was softmax — sources competed)
-        r_L1,r_L2,r_L3=self.telescoping_mem.retrieve_all(x_c_query)
-        r_arch=self.surprise_archive.retrieve(x_c_query)
-        r_comb=gates[0]*r_L1+gates[1]*r_L2+gates[2]*r_L3+gates[3]*r_arch
-        return torch.sigmoid(self.w_outer_gate@x_rm)*r_comb
+    def _update_telescoping(self, x_c_final_chunk: torch.Tensor, s_t: float=0.0,
+                             s_l_full: 'torch.Tensor|None'=None,
+                             chunk_token_ids: 'torch.Tensor|None'=None,
+                             E_min_raw: float=0.0,
+                             sel_l: 'torch.Tensor|None'=None,
+                             training: bool=True) -> torch.Tensor:
+        # §1.51: chunk_mean WITHOUT .detach() so gradient flows to CFL5Layer
+        chunk_mean = x_c_final_chunk.mean(dim=(0, 1))  # (d_c,) — gradient-connected
 
-    def _update_telescoping(self,x_c_final_chunk: torch.Tensor,s_t: float=0.0) -> torch.Tensor:
-        chunk_mean=x_c_final_chunk.mean(dim=(0,1))
-        c1_live=self.W_compress_L1@chunk_mean; x_recon_1=self.W_compress_L1.conj().T@c1_live
-        L_compress=((chunk_mean.detach()-x_recon_1).conj()*(chunk_mean.detach()-x_recon_1)).real.sum()
-        self.telescoping_mem.add_L1(c1_live.detach())
-        if self.telescoping_mem._pending_L2 is not None:
-            pend2=self.telescoping_mem._pending_L2.detach().clone()
-            c2_live=self.W_compress_L2@pend2; x_recon_2=self.W_compress_L2.conj().T@c2_live
-            L_compress=L_compress+((pend2-x_recon_2).conj()*(pend2-x_recon_2)).real.sum()
-            self.telescoping_mem.add_L2(c2_live.detach()); self.telescoping_mem._pending_L2=None
-        if self.telescoping_mem._pending_L3 is not None:
-            pend3=self.telescoping_mem._pending_L3.detach().clone()
-            c3_live=self.W_compress_L3@pend3; x_recon_3=self.W_compress_L3.conj().T@c3_live
-            L_compress=L_compress+((pend3-x_recon_3).conj()*(pend3-x_recon_3)).real.sum()
-            self.telescoping_mem.add_L3(c3_live.detach()); self.telescoping_mem._pending_L3=None
-        self.surprise_archive.maybe_add(c1_live.detach(),s_t)
-        return L_compress
+        # §1.59 VQ-Telescope: store routing weight vectors instead of compressed embeddings
+        bank = self.bank
+        L_vq = torch.tensor(0.0, device=chunk_mean.device)
+        if s_l_full is not None and hasattr(bank, 'buf_L1_w_full'):
+            L_vq = vq_telescope_update(
+                chunk_mean, s_l_full, E_min_raw,
+                chunk_token_ids if chunk_token_ids is not None else torch.zeros(bank.C_chunk, dtype=torch.int32),
+                bank, sel_l if sel_l is not None else torch.zeros(0, dtype=torch.long),
+                self.cfg
+            )
+            bank._last_L_vq = L_vq
+        else:
+            # Fallback: old TelescopingMemory path (pre-VQ)
+            self.telescoping_mem.add_L1(chunk_mean.detach())
+
+        # L_bridge: §1.50 — train W_rc_bridge via local loss
+        with torch.no_grad():
+            last_info = getattr(self, '_last_bridge_info', None)
+        if last_info is not None:
+            sel_b = last_info.get('sel_l'); s_b = last_info.get('s_l')
+            if sel_b is not None and s_b is not None:
+                s_w = s_b.mean(0)[sel_b].to(torch.cfloat)
+                rho_sel = bank.rho_l[sel_b]
+                rho_weighted = (s_w.unsqueeze(-1) * rho_sel).sum(0)
+                r_seed = self.W_rc_bridge @ rho_weighted
+                _cun = self.diff_aux.cun
+                r_seed_target = (_cun.U1.conj() @ chunk_mean.detach())[:_cun.d_r_lista].detach()
+                L_bridge = ((r_seed - r_seed_target).conj() * (r_seed - r_seed_target)).real.sum()
+                self._last_L_bridge = L_bridge
+            else:
+                self._last_L_bridge = torch.tensor(0.0, device=chunk_mean.device)
+        else:
+            self._last_L_bridge = torch.tensor(0.0, device=chunk_mean.device)
+
+        # Welford E_min stats for adaptive spawn threshold (§1.68 C6 / §1.69) — training only
+        bank._last_E_min_raw = E_min_raw  # §1.69: cached for memory_update_v605 spawn gate
+        if training:
+            bank._Emin_n += 1
+            n = bank._Emin_n
+            delta = E_min_raw - bank._Emin_mean
+            bank._Emin_mean += delta / n
+            bank._Emin_var += delta * (E_min_raw - bank._Emin_mean)
+        else:
+            n = bank._Emin_n
+
+        # Surprise archive: threshold driven by Welford mean (§1.68 C6)
+        surprise_thresh = self.cfg.get('surprise_threshold', 0.5)
+        if n > 10:
+            welford_std = (bank._Emin_var / max(n - 1, 1)) ** 0.5
+            surprise_thresh = max(bank._Emin_mean + 2.5 * welford_std, 0.1)
+        if E_min_raw > surprise_thresh:
+            self.surprise_archive.add_vq(bank._L1_ptr - 1, E_min_raw)  # §1.68: store pointer+score
+
+        # §1.54 KA-MC: micro-consolidation per chunk
+        micro_consolidate_arc(bank, self.diff_aux.cun, self.cfg)
+
+        return L_vq
 
     def forward(self,input_ids: torch.Tensor,training: bool=True,use_refinement: bool=False) -> tuple:
         B,T=input_ids.shape
@@ -277,6 +355,40 @@ class CFLNModel(nn.Module):
                 x_in=x_cur[:,t,:]; xn=complex_layer_norm(x_in,[d_c]) if l>0 else x_in
                 xn_aug=xn+self.highway.inject(x_fast_hw,x_slow_hw,l)
                 xn_aug=xn_aug+self._retrieve_all_memory(xn_aug)
+                # §1.32 R3 + §1.39 Z: HYPO/SSP token dispatch (last CFL layer only)
+                if l == len(self.cfl_layers) - 1:
+                    tok = input_ids[:, t]
+                    cun = self.diff_aux.cun
+                    _hypo_start = int(getattr(self, '_hypo_start_id', torch.tensor(-1)).item())
+                    _hypo_end   = int(getattr(self, '_hypo_end_id',   torch.tensor(-1)).item())
+                    _push_goal  = int(getattr(self, '_push_goal_id',  torch.tensor(-1)).item())
+                    _pop_goal   = int(getattr(self, '_pop_goal_id',   torch.tensor(-1)).item())
+                    if _hypo_start >= 0 and (tok == _hypo_start).any():
+                        self.bank._r_lista_hypo = cun.r_lista.clone()
+                        self.bank._in_hypo_mode = True
+                    elif _hypo_end >= 0 and (tok == _hypo_end).any():
+                        if self.bank._r_lista_hypo is not None:
+                            diff_sq = float((self.bank._r_lista_hypo - cun.r_lista).norm()**2)
+                            self.bank._u_hypo = float(torch.sigmoid(torch.tensor(diff_sq / max(cun.d_r_lista, 1))).item())
+                        self.bank._in_hypo_mode = False
+                        self.bank._r_lista_hypo = None
+                    elif _push_goal >= 0 and (tok == _push_goal).any():
+                        if len(cun._goal_stack) < self.cfg.get('ssp_max_depth', 4):
+                            cun._goal_stack.append(cun.r_lista.clone())
+                            cun._stuck_count.append(0)
+                            cun._v_prev.append(1e9)
+                            self.bank._goal_frozen = True  # §1.39: freeze g_c during goal pursuit
+                    elif _pop_goal >= 0 and (tok == _pop_goal).any():
+                        if cun._goal_stack:
+                            parent = cun._goal_stack.pop()
+                            if cun._stuck_count: cun._stuck_count.pop()
+                            if cun._v_prev: cun._v_prev.pop()
+                            # §1.65 C3: Q_BEAM-weighted merge
+                            merge_w = torch.sigmoid(torch.tensor(cun._last_Q_BEAM_score))
+                            with torch.no_grad():
+                                cun.r_lista = (1.0 - merge_w) * parent + merge_w * cun.r_lista
+                            if not cun._goal_stack:
+                                self.bank._goal_frozen = False  # §1.39: unfreeze when stack empty
                 _upd_res=(l==len(self.cfl_layers)-1)  # v5.9.5 B6: only last layer updates reservoir
                 xo,Z,U,info=layer(xn_aug,training=training,lam_p=float(lam_p_vec[l].item()),update_res=_upd_res)
                 ar=torch.exp(layer.log_alpha_res)
@@ -289,14 +401,40 @@ class CFLNModel(nn.Module):
                     s_t=self.encoder.titans.get_surprise(x_c[:,t-C:t,:].mean(dim=(0,1)).detach())
                     # v6.0 CTP: skip telescoping+archive updates during thinking tokens
                     if not self._in_thinking_mode:
-                        L_c=self._update_telescoping(prev_chunk,s_t)
+                        # §1.59 OI-8: pass routing info so VQ write is activated
+                        _info_prev = inf_t[t - C] if t - C >= 0 else inf_t[0]
+                        _sel_c = _info_prev.get('sel_l')
+                        _sl_c  = _info_prev.get('s_l')
+                        _el_c  = _info_prev.get('E_l')
+                        _s_l_full_c = None; _e_min_raw_c = 0.0
+                        if _sel_c is not None and _sl_c is not None:
+                            _s_l_full_c = torch.zeros(self.bank.N_max_l, dtype=torch.float32, device=dev)
+                            _s_l_full_c[_sel_c] = _sl_c.mean(0)[_sel_c].float()
+                            if _el_c is not None:
+                                _e_min_raw_c = float(_el_c.min().item())
+                        L_c=self._update_telescoping(prev_chunk, s_t,
+                                                      s_l_full=_s_l_full_c, sel_l=_sel_c,
+                                                      E_min_raw=_e_min_raw_c, training=training)
                         self._L_compress_accum=(L_c if self._L_compress_accum is None else self._L_compress_accum+L_c)
             x_fast_hw,x_slow_hw=self.highway.update(x_fast_hw,x_slow_hw,x_nxt.mean(1),l)
             x_cur=x_nxt; all_infos.append(inf_t)
         last_start=(T//C)*C
         if last_start<T:
             s_f=self.encoder.titans.get_surprise(x_c[:,last_start:,:].mean(dim=(0,1)).detach())
-            L_c=self._update_telescoping(x_cur[:,last_start:,:],s_f)
+            # §1.59 OI-8: pass routing info from last token of last CFL layer
+            _last_info_tail = all_infos[-1][-1]
+            _sel_tail = _last_info_tail.get('sel_l')
+            _sl_tail  = _last_info_tail.get('s_l')
+            _el_tail  = _last_info_tail.get('E_l')
+            _s_l_full_tail = None; _e_min_raw_tail = 0.0
+            if _sel_tail is not None and _sl_tail is not None:
+                _s_l_full_tail = torch.zeros(self.bank.N_max_l, dtype=torch.float32, device=dev)
+                _s_l_full_tail[_sel_tail] = _sl_tail.mean(0)[_sel_tail].float()
+                if _el_tail is not None:
+                    _e_min_raw_tail = float(_el_tail.min().item())
+            L_c=self._update_telescoping(x_cur[:,last_start:,:], s_f,
+                                          s_l_full=_s_l_full_tail, sel_l=_sel_tail,
+                                          E_min_raw=_e_min_raw_tail, training=training)
             self._L_compress_accum=(L_c if self._L_compress_accum is None else self._L_compress_accum+L_c)
         x_fin=complex_layer_norm(x_cur,[d_c]); meta_refine={}
 
@@ -309,18 +447,21 @@ class CFLNModel(nn.Module):
         # After all L CFL layers, before IterativeRefinement. 'Which units fired' conditions
         # 'what reasoning context to start from'. Makes two-scale RC coherent.
         # RC bridge active at all times (training and inference)
-        with torch.no_grad():  # v5.9.7 M5: removed dead 'if training or True:'
-                last_info=all_infos[-1][-1]   # last CFL layer, last token position
-                sel_bridge=last_info.get('sel_l',None)
-                s_bridge=last_info.get('s_l',None)
-                if sel_bridge is not None and s_bridge is not None:
-                    s_w=s_bridge.mean(0)[sel_bridge].to(torch.cfloat)   # (k_l,)
-                    rho_sel=self.bank.rho_l[sel_bridge]                 # (k_l, d_r_node)
-                    rho_weighted=(s_w.unsqueeze(-1)*rho_sel).sum(0)     # (d_r_node,)
-                    r_seed=self.W_rc_bridge@rho_weighted                # (d_r_lista,)
-                    # Smooth blend: 80% carry-over, 20% new routing context
-                    self.diff_aux.cun.r_lista=(0.8*self.diff_aux.cun.r_lista
-                                               +0.2*r_seed.detach())
+        # §1.50: RC bridge — W_rc_bridge now nn.Parameter, gradient flows for L_bridge
+        last_info=all_infos[-1][-1]   # last CFL layer, last token position
+        self._last_bridge_info = last_info  # cache for _update_telescoping L_bridge
+        sel_bridge=last_info.get('sel_l',None)
+        s_bridge=last_info.get('s_l',None)
+        if sel_bridge is not None and s_bridge is not None:
+            with torch.no_grad():
+                s_w=s_bridge.mean(0)[sel_bridge].to(torch.cfloat)
+                rho_sel=self.bank.rho_l[sel_bridge]
+                rho_weighted=(s_w.unsqueeze(-1)*rho_sel).sum(0)
+                r_seed=self.W_rc_bridge@rho_weighted
+                # §1.73 C10: adaptive blend alpha
+                blend_alpha = float(torch.exp(self.diff_aux.cun.log_blend_alpha).clamp(0.5, 0.95).item())
+                self.diff_aux.cun.r_lista = ((1.0 - blend_alpha) * r_seed.detach()
+                                              + blend_alpha * self.diff_aux.cun.r_lista)
         if use_refinement and not training: x_fin,meta_refine=self.refine_for_inference(x_fin)
         fstats=self._compute_field_stats(all_infos[-1],self.K_stats,dev)
         fe=self.field_stats_proj(fstats); fstats_emb=torch.complex(fe[...,:d_c],fe[...,d_c:])

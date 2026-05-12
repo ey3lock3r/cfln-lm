@@ -16,7 +16,7 @@ def _sample_block(logits, temperature=1.0, top_k=50):
 
 def generate_cfln_dcg_plus(model, prompt_ids, max_new_tokens=100,
                              block_size=8, max_revise_rounds=2,
-                             commit_threshold=0.4, temperature=1.0,
+                             commit_threshold=None, temperature=1.0,
                              top_k=50, self_consistency_K=1,
                              deep_lista_iters=16, use_refinement=True):
     """v5.9.9/v6.0.2 DCG+: Deferred-Commitment Generation.
@@ -41,6 +41,12 @@ def generate_cfln_dcg_plus(model, prompt_ids, max_new_tokens=100,
                                     use_refinement=use_refinement)
         # v6.0.2 C1: save pos_offset after Phase 1 — revision passes must NOT advance it further
         _pos_after_draft = model._pos_offset
+        # §1.74: adaptive commit threshold — sampled once per block from calibrated U_epi
+        if commit_threshold is None:
+            _u_epi_cal = float(getattr(model.bank, '_u_epistemic_last', 0.5))
+            _commit_thr = max(0.1, 1.0 - _u_epi_cal)
+        else:
+            _commit_thr = float(commit_threshold)
 
         all_infos_last = aux['all_infos'][-1]   # last CFL layer, all T positions
         T_ctx = len(all_infos_last)
@@ -65,7 +71,7 @@ def generate_cfln_dcg_plus(model, prompt_ids, max_new_tokens=100,
 
         # ── PHASE 2: REFLECT — optional self-consistency voting ──────────────
         if self_consistency_K > 1:
-            uncertain = (commit_score < commit_threshold).nonzero(as_tuple=True)[0]
+            uncertain = (commit_score < _commit_thr).nonzero(as_tuple=True)[0]
             if len(uncertain) > 0:
                 alt = [draft_tokens.clone()]
                 for _ in range(self_consistency_K - 1):
@@ -77,7 +83,7 @@ def generate_cfln_dcg_plus(model, prompt_ids, max_new_tokens=100,
 
         # ── PHASE 3: SELECTIVE REVISION ──────────────────────────────────────
         for round_i in range(max_revise_rounds):
-            revise_pos = (commit_score < commit_threshold).nonzero(as_tuple=True)[0]
+            revise_pos = (commit_score < _commit_thr).nonzero(as_tuple=True)[0]
             if len(revise_pos) == 0:
                 break
 
@@ -122,7 +128,7 @@ def generate_cfln_dcg_plus(model, prompt_ids, max_new_tokens=100,
         # ── DEEP LISTA SCRATCHPAD (Dr. L/D) ──────────────────────────────────
         # For positions still uncertain: run extra LISTA iterations as implicit thinking
         # These update r_lista WITHOUT generating tokens — continuous scratchpad writes
-        still_uncertain = (commit_score < commit_threshold).nonzero(as_tuple=True)[0]
+        still_uncertain = (commit_score < _commit_thr).nonzero(as_tuple=True)[0]
         if len(still_uncertain) > 0 and deep_lista_iters > 0:
             last_pos = int(still_uncertain[-1].item())
             re_ctx = torch.cat([generated, draft_tokens[:, :last_pos + 1]], dim=1)

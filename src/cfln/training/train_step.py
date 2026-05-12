@@ -5,6 +5,7 @@ import torch.nn.functional as F
 
 from cfln.utils import (normalize_complex_center, batched_cayley_with_per_unit_lr, cayley_retraction_single,
                          stiefel_update_all_v51, detect_domain_boundary)
+from cfln.modules.v9_ops import update_fisher_magnitude_freeze
 from cfln.modules.si import compute_domain_confidence
 
 
@@ -94,8 +95,16 @@ def memory_update_v605(bank, dyn, dormancy, x_c, s_l, a_l_rq,
         ni=_reactivate_from_exemplars(slot,dormancy,bank,dyn,x_rep)
         if ni>=0: ops['reactivated']+=1; dormancy.release_slot(slot)
     n=bank.n_l
-    if s_l.max().item()<eps_s and n<dyn.N_max and ops['reactivated']==0:
-        dyn.spawn(x_c); ops['spawned']+=1
+    # §1.69: Welford-based spawn threshold replaces fixed eps_s check
+    _e_last = getattr(bank, '_last_E_min_raw', None)
+    _emin_n = int(getattr(bank, '_Emin_n', 0))
+    if _e_last is not None and _emin_n >= 10:
+        _sigma = (bank._Emin_var / max(_emin_n - 1, 1)) ** 0.5
+        _spawn_cond = float(_e_last) > bank._Emin_mean + 2.5 * _sigma
+    else:
+        _spawn_cond = s_l.max().item() < eps_s  # fallback before stats stabilise
+    if _spawn_cond and n < dyn.N_max and ops['reactivated'] == 0:
+        dyn.spawn(x_c); ops['spawned'] += 1
     with torch.no_grad():
         act=(s_l.mean(0)>1.0/n).float()
         bank.log_alp_l.data[:n]+=0.01*act[:n]; bank.log_alp_l.data[:n].clamp_(-5,0)
@@ -305,12 +314,96 @@ def train_step_v605(batch, model, opts, si, phase, step,
                         reduction='none',ignore_index=cfg.get('pad_id',-100)).reshape(B,T-1)
     L_task=ce.mean(); L_SI=si.compute_loss(si_params)
     L_null=model.encoder.titans._null_aux_loss or torch.tensor(0.0,device=input_ids.device)
-    L_compress_w=cfg.get('lambda_compress',0.01)
-    L_compress=getattr(model,'_L_compress_accum',None) or torch.tensor(0.0,device=input_ids.device)
-    model._L_compress_accum=None
-    L_pass1=L_task+L_SI+L_null+L_compress_w*L_compress
+    L_pass1=L_task+L_SI+L_null
+
+    # ── v9.0 auxiliary losses ──────────────────────────────────────────────
+    _bank=model.bank; _cun=model.diff_aux.cun
+
+    # L_bridge per CFL layer (§1.50)
+    _lb_sum=torch.tensor(0.0,device=input_ids.device)
+    for _lay in model.cfl_layers:
+        _lb=getattr(_lay,'_last_L_bridge',None)
+        if _lb is not None and isinstance(_lb,torch.Tensor) and _lb.requires_grad:
+            _lb_sum=_lb_sum+_lb
+    L_pass1=L_pass1+cfg.get('lambda_bridge',0.1)*_lb_sum
+
+    # L_vq VQ commitment (§1.59) — _L_compress_accum sums L_vq across ALL chunks in forward()
+    _lvq=model._L_compress_accum
+    if _lvq is not None and isinstance(_lvq,torch.Tensor) and _lvq.requires_grad:
+        L_pass1=L_pass1+cfg.get('lambda_vq',0.01)*_lvq
+    model._L_compress_accum=None  # clear after use
+
+    # L_diversity beam anti-collapse (§1.47)
+    _ldiv=getattr(_cun,'_last_beam_diversity',None)
+    if _ldiv is not None and isinstance(_ldiv, torch.Tensor):
+        L_pass1=L_pass1+cfg.get('lambda_diversity',0.01)*(-_ldiv**2)
+
+    # ROB-L Lipschitz young units (§1.56)
+    _n9=_bank.n_l; _ym=_bank.activation_freq_l[:_n9]<cfg.get('alpha_young',0.1)
+    if _ym.any():
+        L_pass1=L_pass1+cfg.get('lambda_lipschitz',0.001)*_bank.log_alp_l[:_n9][_ym].mean()
+
+    # ROB-S learned phase width (§1.56)
+    if hasattr(_bank,'log_sigma_bind'):
+        L_pass1=L_pass1+cfg.get('lambda_sigma_reg',0.001)*torch.exp(-_bank.log_sigma_bind)
+
+    # L_precision monitoring (§1.58) — non-differentiable tracking term
+    _lp_list=getattr(_cun,'log_precision',None)
+    if _lp_list:
+        _prec_sum=sum(math.exp(p.item() if isinstance(p,torch.Tensor) else float(p)) for p in _lp_list)
+        L_pass1=L_pass1+cfg.get('lambda_prec',0.001)*_prec_sum
+
+    # Fisher-KL penalty from previous step (§1.57)
+    _bkl_wu=cfg.get('beta_KL_warmup',500)
+    if step>_bkl_wu and hasattr(model,'_fisher_diag') and model._fisher_diag:
+        _kl_w=cfg.get('beta_KL',0.5)*min(1.0,(step-_bkl_wu)/max(_bkl_wu,1))
+        _L_KL=torch.tensor(0.0,device=input_ids.device)
+        for _kp in (p for pg in opt_g.param_groups for p in pg['params']):
+            _fid=id(_kp)
+            if _fid in model._fisher_diag and _fid in model._fisher_ref:
+                _d=_kp-model._fisher_ref[_fid]
+                _dr=_d.real if _kp.is_complex() else _d
+                _L_KL=_L_KL+(model._fisher_diag[_fid]*_dr.pow(2)).sum()
+        L_pass1=L_pass1+_kl_w*_L_KL
+
+    # SE-2 MDLM masking (stage 0 only, §1.44)
+    if stage==0 and cfg.get('p_mask',0.0)>0.0:
+        _pm=cfg.get('p_mask',0.15); _mtok=cfg.get('mask_token_id',1)
+        _mpos=torch.bernoulli(torch.full((B,T),_pm,device=input_ids.device)).bool()
+        if _mpos.any():
+            _mid=input_ids.clone(); _mid[_mpos]=_mtok
+            _lm,_,_=model(_mid,training=False)
+            _tgtm=input_ids.reshape(-1).clone(); _tgtm[~_mpos.reshape(-1)]=-100
+            _Lmlm=F.cross_entropy(_lm.reshape(-1,_lm.size(-1)),_tgtm,ignore_index=-100)
+            L_pass1=L_pass1+cfg.get('lambda_mlm',0.3)*_Lmlm
 
     opt_g.zero_grad(); muon.zero_grad(); L_pass1.backward()
+
+    # Accumulate Fisher diagonal (§1.57) — after backward, before clip
+    if not hasattr(model,'_fisher_diag'): model._fisher_diag={}; model._fisher_ref={}
+    _stiefel_ids={id(model.bank.W_l),id(model.bank.W_p)}
+    for _kp in (p for pg in opt_g.param_groups for p in pg['params']):
+        if id(_kp) in _stiefel_ids or _kp.grad is None: continue
+        _gr=_kp.grad.real if _kp.is_complex() else _kp.grad
+        _f2=(_gr.detach()**2)
+        _fid=id(_kp)
+        if _fid not in model._fisher_diag:
+            model._fisher_diag[_fid]=_f2.clone(); model._fisher_ref[_fid]=_kp.detach().clone()
+        else:
+            model._fisher_diag[_fid].mul_(0.99).add_(_f2,alpha=0.01)
+
+    # §1.63: accumulate W_l per-unit scalar Fisher (W_l excluded from AdamW loop above)
+    if model.bank.W_l.grad is not None:
+        _wl_id = id(model.bank.W_l)
+        _wl_g2 = model.bank.W_l.grad[:_bank.n_l].abs().mean(dim=(-2, -1)).detach()  # (n_l,)
+        if _wl_id not in model._fisher_diag:
+            model._fisher_diag[_wl_id] = _wl_g2.clone()
+        else:
+            model._fisher_diag[_wl_id].mul_(0.99).add_(_wl_g2, alpha=0.01)
+    # Fisher-magnitude freeze check — every 100 steps (§1.63 C1)
+    if step % 100 == 0:
+        update_fisher_magnitude_freeze(_bank, model._fisher_diag)
+
     si.update_embed_omega(model,input_ids)
     torch.nn.utils.clip_grad_norm_(list(model.lam_p_schedule.parameters()),
                                     cfg.get('schedule_grad_clip',0.5), foreach=False)
@@ -321,7 +414,7 @@ def train_step_v605(batch, model, opts, si, phase, step,
     _cached_w_l_grad_norms=None
     if model.bank.W_l.grad is not None:
         _cached_w_l_grad_norms=model.bank.W_l.grad[:model.bank.n_l].norm(dim=(-2,-1)).detach().clone()
-    stiefel_update_v58(model.bank,si,lr_s,cfg.get('beta_SI',3.0))
+    stiefel_update_v58(model.bank,si,lr_s,cfg.get('beta_SI_stiefel',0.25))
     stiefel_update_all_v51(model.bank,lr_l=0,lr_p=cfg.get('lr_persist',1e-6))  # v6.0.9: lr_g removed (global tier gone)
     muon.step(lr=lr_muon_s)
     _resolve_opt_grads(opt_g); opt_g.step()
@@ -394,6 +487,18 @@ def train_step_v605(batch, model, opts, si, phase, step,
                             cfg.get('memory_thresholds',DEFAULT_MEMORY_THRESHOLDS),  # v5.9.5 D5
                             cached_grad_norms=_cached_w_l_grad_norms,si=si)
 
+    # Batched PSD every psd_apply_every steps (§1.11 I3)
+    _psd_freq=cfg.get('psd_apply_every',10)
+    if step%_psd_freq==0 and step>0:
+        from cfln.utils import apply_psd_to_weight_matrix as _psd_fn
+        _n9l=model.bank.n_l
+        with torch.no_grad():
+            for _pi in range(0,_n9l,64):
+                _sl=slice(_pi,min(_pi+64,_n9l))
+                _W_block=model.bank.W_l.data[_sl]
+                for _wi in range(_W_block.shape[0]):
+                    model.bank.W_l.data[_pi+_wi]=_psd_fn(_W_block[_wi].float()).to(model.bank.W_l.dtype)
+
     mon=model.monitor.step(step,[info[0] for info in all_infos])
     _update_lam_p_corrections(model,mon,cfg)
     si_warmup=cfg.get('si_warmup_steps',1000)
@@ -426,13 +531,14 @@ def train_step_v605(batch, model, opts, si, phase, step,
             model.encoder.titans.domain_shift_detected=False
 
     return {
-        'L_task':float(L_task),
-        'L_SI':float(L_SI) if isinstance(L_SI,torch.Tensor) else 0.0,
-        'L_diff':float(L_diff),'L_lista':float(L_lista),
-        'L_compress':float(L_compress)*L_compress_w,
-        'L_null':float(L_null) if isinstance(L_null,torch.Tensor) else 0.0,
-        'L_local':float(L_local) if isinstance(L_local,torch.Tensor) else 0.0,
-        'U_mean':float(U_fin.mean()),
+        'L_task':float(L_task.detach()),
+        'L_SI':float(L_SI.detach()) if isinstance(L_SI,torch.Tensor) else 0.0,
+        'L_diff':float(L_diff.detach() if isinstance(L_diff,torch.Tensor) else L_diff),
+        'L_lista':float(L_lista.detach() if isinstance(L_lista,torch.Tensor) else L_lista),
+        'L_compress':0.0,
+        'L_null':float(L_null.detach()) if isinstance(L_null,torch.Tensor) else 0.0,
+        'L_local':float(L_local.detach()) if isinstance(L_local,torch.Tensor) else 0.0,
+        'U_mean':float(U_fin.detach().mean()),
         'n_sensory':int(model.bank.is_sensory_l[:model.bank.n_l].sum()),
         'n_dormant':model.dormancy_buf.n_dormant,
         'domain':model.domain_handler.current_domain,
