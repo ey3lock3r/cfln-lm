@@ -43,25 +43,36 @@ class CFL5Layer(nn.Module):
         B,d_c=x_c.shape; bank=self.bank; n_l=bank.n_l; device=x_c.device
         x_c_mean=x_c.mean(0)   # (d_c,) used in psi_for and reservoir update
 
+        # §1.33 R4: goal-anchored context — update g_c, compute x_c_eff BEFORE routing
+        _freeze_goal = getattr(bank, '_in_hypo_mode', False) or getattr(bank, '_goal_frozen', False)
+        if not _freeze_goal:
+            g_t = torch.sigmoid(bank.W_goal_detect @ x_c_mean.real.unsqueeze(-1)).squeeze()  # scalar
+            with torch.no_grad():
+                bank.g_c = g_t * x_c_mean + (1.0 - g_t) * bank.g_c
+        x_c_eff = x_c + torch.exp(bank.log_lam_goal) * bank.g_c.unsqueeze(0)  # (B, d_c)
+
         # ── ROUTING: 2-tier (local + persistent) v6.0.8 ─────────────────────
-        E_l =compute_energies(x_c,bank.W_l.data[:n_l],bank.mu_c_l[:n_l])
+        E_l =compute_energies(x_c_eff,bank.W_l.data[:n_l],bank.mu_c_l[:n_l])
         a_rq=rq_routing(E_l,bank.log_alpha_rq_l[:n_l],bank.log_ell_l[:n_l])
         s_l =entmax15_with_floor(a_rq*torch.exp(bank.log_alp_l[:n_l]).unsqueeze(0),1e-4)
         if not local_only:
-            E_p=compute_energies(x_c,bank.W_p.data,bank.mu_c_p)
+            E_p=compute_energies(x_c_eff,bank.W_p.data,bank.mu_c_p)
             s_p=torch.softmax(
                 torch.exp(-E_p/torch.exp(2*bank.log_ell_p))*torch.exp(bank.log_alp_p),dim=-1)
 
-        k_l=min(40,n_l)
+        _u_cal = float(getattr(bank, '_u_epistemic_last', 0.5))
+        _k_min = int(getattr(bank, 'k_l_min', 20))
+        _k_max = int(getattr(bank, 'k_l_max', 60))
+        k_l = min(n_l, _k_min + round((_k_max - _k_min) * _u_cal))
         _,sel_l=torch.topk(s_l.mean(0),k_l)
         # v6.0.7 MC-3: U_temporal — representation drift rate
         x_c_mean_d=x_c_mean.detach()
         if bank._x_c_prev_bank.shape==x_c_mean_d.shape:
             delta_t=(x_c_mean_d-bank._x_c_prev_bank).norm()/(bank._x_c_prev_bank.norm().clamp(1e-8))
             bank._ema_delta_bank=0.95*bank._ema_delta_bank+0.05*delta_t
-            u_temporal_val=float(torch.sigmoid(2.0*(delta_t/(bank._ema_delta_bank.clamp(1e-8))-1.0)).item())
+            _u_temporal_val=float(torch.sigmoid(2.0*(delta_t/(bank._ema_delta_bank.clamp(1e-8))-1.0)).item())
         else:
-            u_temporal_val=0.0
+            _u_temporal_val=0.0
         with torch.no_grad(): bank._x_c_prev_bank=x_c_mean_d.clone()
 
         # ── PSI_FOR: local tier uses PREDICTIVE prototype + RESERVOIR phase ──
@@ -89,7 +100,6 @@ class CFL5Layer(nn.Module):
         psi_l=psi_for_local_rc(sel_l)
         psi_all=psi_l                                          # (k_l, d_c)
 
-        k_t=psi_all.shape[0]
         mu_all=bank.mu_c_l[sel_l]
         theta_all=compute_direction_angles_complex(mu_all)
 
@@ -107,6 +117,48 @@ class CFL5Layer(nn.Module):
         lam_sg=torch.exp(self.log_lam_seq_gat).clamp(max=0.5)   # v6.0.2 C3: grad flows; v6.0.4 C3: bounded ≤0.5
         H_seq_norm=H_seq_sub*(mx/H_seq_sub.max().clamp(1e-8))
         W_full[:k_l,:k_l]=W_full[:k_l,:k_l]+lam_sg*H_seq_norm
+        # §1.31 R2: relational eigenvector for dual-key ARC (requires sel_k, only available here)
+        try:
+            _,_eigvecs=torch.linalg.eigh(H_seq_sub.real.float())
+            bank._phi_rel_cache=_eigvecs[:,-1].detach().to(torch.cfloat)  # (k_l,)
+        except Exception:
+            bank._phi_rel_cache=None
+
+        # §1.43 SE-1 / §1.70 C7: k-shot centroid refinement for young units
+        K_proto_max = bank.__dict__.get('K_proto_max', 10) or 10
+        tau_proto_min = float(getattr(bank, 'tau_proto_min', 0.4))  # §1.70 C7: U_epi gate threshold
+        alpha_young = 0.1
+        u_epi_cal = float(getattr(bank, '_u_epistemic_last', 1.0))  # §1.70: gate on calibrated U_epi
+        with torch.no_grad():
+            for _i, _uid in enumerate(sel_l.tolist()):
+                freq = float(bank.activation_freq_l[_uid].item())
+                cnt  = int(bank._proto_count[_uid].item())
+                if freq < alpha_young and cnt < K_proto_max and u_epi_cal < tau_proto_min:
+                    # cosine similarity guard (threshold 0.4 per §1.70)
+                    _xm = x_c_mean / x_c_mean.norm().clamp(1e-8)
+                    _mu = bank.mu_c_l[_uid] / bank.mu_c_l[_uid].norm().clamp(1e-8)
+                    if float((_xm.conj() * _mu).real.sum().item()) > 0.4:
+                        bank._proto_count[_uid] += 1
+                        bank._proto_sum.data[_uid] += x_c_mean
+                        bank.mu_c_l.data[_uid] = bank._proto_sum[_uid] / float(bank._proto_count[_uid].item())
+
+        # §1.30 R1 + §1.41 W2: phase binding kernel B_bind (PSD by Bochner's theorem)
+        phi_sel = torch.angle(bank.H_c_l[sel_l].mean(-1).mean(-1))  # (k_l,) real phases
+        phi_diff = phi_sel.unsqueeze(0) - phi_sel.unsqueeze(1)       # (k_l, k_l)
+        sigma_sq_bind = torch.exp(2.0 * bank.log_sigma_bind)
+        B_bind = torch.exp(-phi_diff**2 / sigma_sq_bind.clamp(1e-6)).float()  # (k_l, k_l)
+        W_full[:k_l,:k_l] = W_full[:k_l,:k_l] + torch.exp(bank.log_lam_bind) * B_bind.to(W_full.dtype)
+
+        # §1.35 X: role binding B_role = α @ α.T (PSD by construction)
+        alpha_role = torch.softmax(
+            (bank.mu_c_l[sel_l] @ bank.role_vecs.conj().T).real / (d_c**0.5), dim=-1
+        )  # (k_l, R)
+        B_role = (alpha_role @ alpha_role.T).float()  # (k_l, k_l)
+        W_full[:k_l,:k_l] = W_full[:k_l,:k_l] + torch.exp(bank.log_lam_role) * B_role.to(W_full.dtype)
+
+        # §1.55 COMP-H: Hadamard composition B_comp = B_bind ⊙ B_role (PSD by Schur product theorem)
+        B_comp = B_bind * B_role  # (k_l, k_l)
+        W_full[:k_l,:k_l] = W_full[:k_l,:k_l] + torch.exp(bank.log_lam_composition) * B_comp.to(W_full.dtype)
 
         # ── GAT AGGREGATION (k_l=40 only; 6.76× cheaper than k_l+k_g=104) ──
         h_filt=bank.gat(psi_all,theta_all,W_full)

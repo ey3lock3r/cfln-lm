@@ -22,6 +22,13 @@ class DynamicLocalBank:
             if hasattr(bk,'log_decode_scale'):                      # v6.0.6: reset frequency filter
                 bk.log_decode_scale.data[idx].zero_()              # init 0 → uniform weighting
             bk.active_mask_l[idx]=True; bk.is_sensory_l[idx]=False; bk.activation_freq_l[idx]=0.0
+            # §1.43 SE-1: init k-shot centroid tracking
+            if hasattr(bk, '_proto_count'):
+                bk._proto_count[idx] = 1
+                bk._proto_sum.data[idx] = bk.mu_c_l.data[idx].clone()
+            # §1.63 C1: reset fisher unit
+            if hasattr(bk, 'fisher_unit'):
+                bk.fisher_unit[idx] = 0.0
         self.n_active+=1; bk.n_l=self.n_active; return idx
 
     def prune(self,keep_idx: torch.Tensor,dormancy=None,si=None):
@@ -43,6 +50,13 @@ class DynamicLocalBank:
             bk.H_c_l[:k]=bk.H_c_l[all_keep.to(_dev)]
             bk.h_c_l[:k]=bk.h_c_l[all_keep.to(_dev)]
             bk.rho_l[:k]=bk.rho_l[all_keep.to(_dev)]
+            # §1.43 SE-1: remap k-shot centroid buffers
+            if hasattr(bk, '_proto_count'):
+                bk._proto_count[:k]=bk._proto_count[all_keep.to(_dev)]
+                bk._proto_sum[:k]=bk._proto_sum[all_keep.to(_dev)]
+            # §1.63 C1: remap fisher unit
+            if hasattr(bk, 'fisher_unit'):
+                bk.fisher_unit[:k]=bk.fisher_unit[all_keep.to(_dev)]
             bk.active_mask_l[:k]=True; bk.active_mask_l[k:]=False
         if si is not None: si.remap_after_prune(all_keep)
         bk.coact_register.remap_after_prune(all_keep)

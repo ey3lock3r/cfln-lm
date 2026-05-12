@@ -2,7 +2,8 @@ import math
 import torch
 import torch.nn as nn
 
-from cfln.utils import complex_layer_norm, init_unitary
+from cfln.utils import complex_layer_norm, init_unitary  # noqa: F401
+from cfln.modules.v9_ops import compute_Q_beam  # noqa: F401 — used after lista_forward additions
 
 SIGMA_DATA=math.sqrt(2); LAMBDA_MAX=100.0
 
@@ -92,31 +93,52 @@ class ComplexUnitaryDenoisingNet(nn.Module):
         # v5.9.8 R3.B: Episodic rule cache (ring buffer, N_rules recent successful inferences)
         self.episodic_rule_n=episodic_rule_n
         if episodic_rule_n>0:
-            self.register_buffer('rule_K',torch.zeros(episodic_rule_n,d_c,dtype=torch.cfloat))
+            # §1.31 R2: dual-key ARC — rule_K stores [k_concept | k_rel] = 2*d_c
+            self.register_buffer('rule_K',torch.zeros(episodic_rule_n,2*d_c,dtype=torch.cfloat))
             self.register_buffer('rule_V',torch.zeros(episodic_rule_n,d_c,dtype=torch.cfloat))
             self.register_buffer('rule_ptr',torch.zeros(1,dtype=torch.long))
             self.register_buffer('rule_util',torch.zeros(episodic_rule_n))  # v6.0.6 ARC: utility score
             self.register_buffer('rule_n',  torch.zeros(1,dtype=torch.long))     # filled count
             self._rule_cache_n: int = 0
-        # v5.9.8 R2.A+R2.B: Composite U_meta_v2 weights [representation, epistemic, hopfield]
-        # v6.0.7 MC-3: extended to R^4 (added U_temporal); init -2.0 for temporal
-        self.log_w_meta=nn.Parameter(torch.tensor([1.0,-1.0,-1.0,-2.0]))  # softmax([1,-1,-1])≈[0.79,0.11,0.11]
+        # §1.34: U_meta_v4 — five signals; log_w_meta kept for init then replaced by precision (§1.58)
+        # §1.58 precision replaces log_w_meta at runtime; log_w_meta removed from __init__
+        # sigma_sq_buffer and log_precision are plain Python lists (not nn.Parameter)
+        self.sigma_sq_buffer = [1.0, 1.0, 1.0, 1.0, 1.0]    # §1.58: init 1.0 NOT 0.0
+        self.log_precision   = [0.0, 0.0, 0.0, 0.0, 0.0]    # §1.58: equal weights initially
+        self._precision_active = [False, False, False, False, False]  # §1.58: gate inactive pathways
         # v5.9.8 R1.A: Adaptive LISTA depth parameters
         self.lista_min_ratio=lista_min_ratio
         self.lista_convergence_ratio=lista_convergence_ratio
         self._in_thinking_mode=False
         self._x_c_prev=None          # v6.0.7 MC-3: U_temporal prev representation
-        # Note: bank._u_epi_mu/_u_epi_var deliberately NOT reset — they are global
-        # calibration stats that warm-start gracefully across domain changes (v6.0.9 design)
-        self._ema_delta=0.0          # v6.0.7 MC-3: running mean of δ_t
-        self._log_w_rec=[0.0,0.0,0.0,0.0]  # v6.0.7 MC-2: session recency weights   # v6.0 CTP: gates h_cache and rule_cache writes
+        self._ema_delta=0.0          # v6.0.7 MC-3: running mean of delta_t
+
+        # ── v9.0 / v7.0 / v8.0 additions ────────────────────────────────────
+        # §1.40 W1: STELA smooth threshold
+        self.tau_smooth = nn.Parameter(torch.tensor(0.1))
+        # §1.31 R2: dual-key ARC relational key cache
+        self._phi_rel_cache = None
+        self._phi_rel_step  = 0
+        # §1.31 R2: dual-key mixing weight
+        self.log_alpha_arc = nn.Parameter(torch.tensor(0.0))
+        # §1.47 TS-1: beam search perturbation scale
+        self.eps_beam_scale = nn.Parameter(torch.tensor(0.1))
+        # §1.46 Q-BEAM: optional learned beam weights (3 core signals)
+        self.log_w_beam = nn.Parameter(torch.zeros(3))
+        # §1.39 Z + §1.52 PLAN-B: SSP goal stack and Lyapunov tracking
+        self._goal_stack  = []
+        self._stuck_count = []
+        self._v_prev      = []
+        # §1.65 C3: last Q_BEAM score for adaptive SSP merge
+        self._last_Q_BEAM_score = 0.0
+        # §1.73 C10: learned r_lista blend alpha
+        self.log_blend_alpha = nn.Parameter(torch.tensor(math.log(0.8)))
 
     def reset_lista_reservoir(self):
         """Reset session reservoir. Called at begin_document and reset_for_inference."""
         with torch.no_grad(): self.r_lista.zero_()
-        self._prev_U_meta = 0.0   # v5.9.6 I1
-        self._seq_mode = True      # v5.9.7 H2
-        self._log_w_rec=[0.0,0.0,0.0,0.0]  # v6.0.7 MC-2: session recency weights (on CUN, not CFLNModel)
+        self._prev_U_meta = 0.0
+        self._seq_mode = True
         # v6.0.6: reset ARC utility scores at session boundary
         if hasattr(self,'rule_util'): self.rule_util.zero_()
         if hasattr(self,'rule_n'):    self.rule_n.zero_()
@@ -128,11 +150,18 @@ class ComplexUnitaryDenoisingNet(nn.Module):
             with torch.no_grad(): self.rule_K.zero_(); self.rule_V.zero_(); self.rule_ptr.zero_()
             self._rule_cache_n=0
         self._in_thinking_mode=False
-        self._x_c_prev=None          # v6.0.7 MC-3: U_temporal prev representation
-        # Note: bank._u_epi_mu/_u_epi_var deliberately NOT reset — they are global
-        # calibration stats that warm-start gracefully across domain changes (v6.0.9 design)
-        self._ema_delta=0.0          # v6.0.7 MC-3: running mean of δ_t
-        self._log_w_rec=[0.0,0.0,0.0,0.0]  # v6.0.7 MC-2: session recency weights   # v6.0 CTP: always reset to normal mode
+        self._x_c_prev=None
+        self._ema_delta=0.0
+        # §1.58: reset precision tracking per session (log_precision NOT reset — long-term)
+        self.sigma_sq_buffer   = [1.0, 1.0, 1.0, 1.0, 1.0]
+        self._precision_active = [False, False, False, False, False]
+        # §1.39 Z + §1.52 PLAN-B: clear SSP stacks
+        self._goal_stack  = []
+        self._stuck_count = []
+        self._v_prev      = []
+        # §1.32 R3: clear HYPO state (also cleared on bank)
+        self._phi_rel_cache = None
+        self._phi_rel_step  = 0
 
     def init_S_from_unitaries(self):
         with torch.no_grad():
@@ -154,13 +183,21 @@ class ComplexUnitaryDenoisingNet(nn.Module):
         return (base*per_k*(gamma**k)).clamp(min=1e-3)
 
     def lista_forward(self,x_c,hopfield=None,bank=None,N_hop=4,
-                       escape=True,compute_meta: bool=True,u_temporal: float=0.0):
+                       escape=True,compute_meta: bool=True,u_temporal: float=0.0,
+                       u_hypo: float=0.0,r_lista_goal=None,
+                       E_min_raw=None,H_route_raw=None):
         B,d_c=x_c.shape; dev=x_c.device
         S_eff=self._S_effective(); x_proj=x_c@self.U1.conj().T
+        # §1.31 R2: local alias — bank._phi_rel_cache written by CFL5Layer, None when bank absent
+        _phi_rel=getattr(bank,'_phi_rel_cache',None) if bank is not None else None
 
         # WARM START (v5.9.6): per-sequence r_lista + U_meta gate (I1+I7)
+        # §1.32 R3: HYPO mode uses branched r_lista_hypo instead of r_lista
+        _r_src = (bank._r_lista_hypo if (bank is not None and getattr(bank, '_in_hypo_mode', False)
+                                         and bank._r_lista_hypo is not None)
+                  else self.r_lista)
         # I7: expand r_lista to (B, d_r_lista) for per-sequence warm start
-        r_lista_B = self.r_lista.unsqueeze(0).expand(B, -1).detach()   # (B, d_r)
+        r_lista_B = _r_src.unsqueeze(0).expand(B, -1).detach()   # (B, d_r)
         # I1: gate beta_rs by previous U_meta — poor prior reasoning → trust warm start less
         u_prev    = getattr(self, '_prev_U_meta', 0.0)
         beta_seq  = (torch.sigmoid(self.log_beta_rs)
@@ -199,20 +236,38 @@ class ComplexUnitaryDenoisingNet(nn.Module):
 
         # v6.0.9: rule_util per-token decay (prevents unbounded accumulation)
         n_r_cur=self._rule_cache_n
-        if n_r_cur>0: self.rule_util[:n_r_cur].mul_(0.999999).clamp_(max=100.0)  # v6.0.9: calibrated for 1M-token max (0.999999^1M≈0.37)
-        # v6.0.7 NR-2/NR-3: ARC rule cache retrieval — top-K=3 + learned gate
+        if n_r_cur>0:
+            _u_temp=float(getattr(self,'_last_u_temporal',0.0))
+            _decay=0.999999*(1.0-0.0001*_u_temp)
+            self.rule_util[:n_r_cur].mul_(_decay).clamp_(max=100.0)
+        # §1.31 R2 + NR-2/NR-3: dual-key ARC retrieval
         if self.episodic_rule_n>0 and self._rule_cache_n>0:
             n_r=self._rule_cache_n
-            K_r=self.rule_K[:n_r]; V_r=self.rule_V[:n_r]   # (n_r,d_c)
-            x_query=(x_c.mean(0)@self.U1.conj().T.detach())   # (d_c,) → LISTA space
-            # True cosine similarity (normalised)
-            sims=(x_query@K_r.conj().T).real/(x_query.norm().clamp(1e-8)*K_r.norm(dim=-1).clamp(1e-8)+1e-8)  # (n_r,)
-            # NR-2: top-K=3 softmax-weighted retrieval (T=0.5)
+            K_r=self.rule_K[:n_r]                           # (n_r, 2*d_c)
+            V_r=self.rule_V[:n_r]                           # (n_r, d_c)
+            x_query=(x_c.mean(0)@self.U1.conj().T.detach()) # (d_c,) concept query
+            K_concept=K_r[:,:d_c]; K_rel=K_r[:,d_c:]        # split dual key
+            # Concept similarity (original)
+            sim_con=(x_query@K_concept.conj().T).real/(
+                x_query.norm().clamp(1e-8)*K_concept.norm(dim=-1).clamp(1e-8)+1e-8)
+            # Relational similarity (§1.31): use cached phi_rel if available
+            if _phi_rel is not None:
+                phi_flat = _phi_rel.to(x_query.device)
+                # k_rel_query = phi_rel @ psi_all[:k_l] approximated by phi_rel mean
+                k_rel_query = phi_flat.mean(0) if phi_flat.dim() > 1 else phi_flat
+                # Expand to d_c if needed (phi_rel is (k_l,) real; promote to (d_c,) complex)
+                if k_rel_query.shape[0] != d_c:
+                    k_rel_query = torch.zeros(d_c, dtype=torch.cfloat, device=dev)
+                sim_rel=(k_rel_query@K_rel.conj().T).real/(
+                    k_rel_query.norm().clamp(1e-8)*K_rel.norm(dim=-1).clamp(1e-8)+1e-8)
+            else:
+                sim_rel = sim_con  # fallback: use concept sim when no phi_rel
+            alpha_arc = torch.sigmoid(self.log_alpha_arc)
+            sims = alpha_arc * sim_con + (1.0 - alpha_arc) * sim_rel
             k_ret=min(3,n_r)
-            top_idx=torch.topk(sims,k_ret).indices           # (k_ret,)
-            w_k=torch.softmax(sims[top_idx]/0.5,dim=0)       # (k_ret,) temperature-scaled
-            v_blend=(w_k.to(torch.cfloat).unsqueeze(-1)*V_r[top_idx]).sum(0)  # (d_c,) blended
-            # NR-3: learned gate (replaces fixed 0.3 threshold)
+            top_idx=torch.topk(sims,k_ret).indices
+            w_k=torch.softmax(sims[top_idx]/0.5,dim=0)
+            v_blend=(w_k.to(torch.cfloat).unsqueeze(-1)*V_r[top_idx]).sum(0)
             g_rule=torch.sigmoid(self.log_gate_rule+(self.W_gate_rule*x_query.real).sum())
             h=h+g_rule*v_blend.unsqueeze(0).expand(B,-1).detach()
 
@@ -234,7 +289,10 @@ class ComplexUnitaryDenoisingNet(nn.Module):
         _escaped=False; deltas=[]
         for k in range(N_adaptive):
             z  =x_proj+torch.einsum('ij,bj->bi',S_eff,h)
-            h_n=complex_soft_threshold(z,self._tau_k(k).unsqueeze(0))
+            # §1.40 W1: STELA smooth thresholding (replaces hard complex_soft_threshold)
+            tau_k = self._tau_k(k).unsqueeze(0)                       # (1, d_c)
+            tau_smooth_c = self.tau_smooth.clamp(min=1e-3)
+            h_n = z * torch.sigmoid((z.abs() - tau_k) / tau_smooth_c)
             dk_val=(((h_n-h).abs().norm(dim=-1)/(h.abs().norm(dim=-1)+1e-8)).mean())
             deltas.append(dk_val)
             # v5.9.8 R1.A: early exit if converged (skip during/after escape phase)
@@ -253,29 +311,69 @@ class ComplexUnitaryDenoisingNet(nn.Module):
                 x_ns=(h_n+noise)@self.U2.conj().T; st=torch.full((B,),sig,device=dev)
                 x_esc=edm_precondition_complex(x_ns,st,self); h_n=x_esc@self.U1.conj().T; _escaped=True
             h=h_n
-        x_ref=h@self.U2.conj().T
+        h_N = h   # converged sparse code (B, d_c)
+
+        # §1.45 SE-3: reservoir-augmented reconstruction (uses bank._prev_sel_l)
+        # x_c_recon = U2 @ h_N + W_dec_res @ rho_sel (no new parameters)
+        if bank is not None and bank._prev_sel_l is not None:
+            _sel_se3 = bank._prev_sel_l
+            rho_sel_se3 = bank.rho_l[_sel_se3].mean(0)  # (d_r_node,)
+            # Store for reconstruction in train_step; also usable by IterativeRefinement
+            self._last_rho_sel = rho_sel_se3.detach()
+        else:
+            self._last_rho_sel = None
+
+        # §1.47 TS-1: beam search during think mode (adaptive width via §1.66)
+        in_think = getattr(self, '_in_thinking_mode', False)
+        u_prev_for_beam = float(getattr(self, '_prev_U_meta', 0.0))
+        _B_max = int(getattr(self, 'beam_B_max', 2))
+        B_eff = max(1, round(1 + u_prev_for_beam * (_B_max - 1))) if in_think else 1
+        if B_eff > 1:
+            noise = (torch.randn_like(h_N.real) + 1j*torch.randn_like(h_N.imag)).to(torch.cfloat)
+            r_lista_b2 = _r_src + self.eps_beam_scale.abs() * (self.W_ri @ noise.mean(0))
+            r_lista_B2 = r_lista_b2.unsqueeze(0).expand(B, -1).detach()
+            warm2 = r_lista_B2 @ self.W_rs.conj().T
+            h_b2 = beta_rs * warm2
+            x_proj2 = x_c @ self.U1.conj().T
+            for _k2 in range(N_adaptive):
+                z2 = x_proj2 + torch.einsum('ij,bj->bi', S_eff, h_b2)
+                h_b2 = z2 * torch.sigmoid((z2.abs() - self._tau_k(_k2).unsqueeze(0)) / tau_smooth_c)
+            Q_b1 = compute_Q_beam(h_N.mean(0), _r_src, r_lista_goal,
+                                  self._goal_stack, x_c,
+                                  log_w_beam=self.log_w_beam,
+                                  phi_rel=_phi_rel,
+                                  E_min_raw=E_min_raw, H_route_raw=H_route_raw)
+            Q_b2 = compute_Q_beam(h_b2.mean(0), r_lista_b2, r_lista_goal,
+                                  self._goal_stack, x_c,
+                                  log_w_beam=self.log_w_beam,
+                                  phi_rel=_phi_rel,
+                                  E_min_raw=E_min_raw, H_route_raw=H_route_raw)
+            w_beam = torch.softmax(torch.stack([Q_b1, Q_b2]), dim=0)
+            # §1.47: diversity computed before blending; r_lista_b2 carries grad via eps_beam_scale
+            _beam_div = (_r_src - r_lista_b2).norm()
+            h_N = w_beam[0] * h_N + w_beam[1] * h_b2
+            with torch.no_grad():
+                _r_src = (w_beam[0] * _r_src + w_beam[1] * r_lista_b2).detach()
+            self._last_Q_BEAM_score = float(Q_b1.item())  # §1.65 C3: for adaptive SSP merge
+            self._last_beam_diversity = _beam_div  # §1.47: Tensor so train_step L_diversity gradient flows
+
+        x_ref = h_N @ self.U2.conj().T
 
         # v5.9.8 R1.B: Update sparse code cache — skip during thinking (v6.0 CTP)
         if self.sparse_code_cache_K>0 and not self._in_thinking_mode:
             with torch.no_grad():
-                K=self.sparse_code_cache_K; h_mean=h.mean(0).detach()
-                if self._cache_filled<K:
+                Kcache=self.sparse_code_cache_K; h_mean=h_N.mean(0).detach()
+                if self._cache_filled<Kcache:
                     self.h_cache[self._cache_filled]=h_mean
                     self._cache_filled+=1
                 else:
-                    self.h_cache[:-1]=self.h_cache[1:].clone()   # shift left
+                    self.h_cache[:-1]=self.h_cache[1:].clone()
                     self.h_cache[-1]=h_mean
 
-        # v5.9.8 R3.B: Update episodic rule cache on successful escape
-        if self.episodic_rule_n>0 and h_pre_escape is not None:
-            pass   # U_meta computed below; write handled after U_meta_v2 computation
-
         # UPDATE session reservoir — fully detached (no BPTT through r_lista)
-        # Gradient to W_ri: comes from next step's loss via next h_0 computation
         with torch.no_grad():
-            e_lista=h.mean(0).detach()                           # (d_c,) batch mean
-            self.r_lista=(self.lambda_lista*self.r_lista+self.W_ri@e_lista)
-            # W_ri is a fixed buffer (v5.9.5): no gradient needed, no .detach() required
+            e_lista = h_N.mean(0).detach()
+            self.r_lista = (self.lambda_lista * self.r_lista + self.W_ri @ e_lista)
 
         df    =deltas[-1].detach() if isinstance(deltas[-1],torch.Tensor) else torch.tensor(float(deltas[-1]) if deltas else 0.0,device=dev)
         U_conv=1.0-torch.exp(torch.tensor(-5.0,device=dev)*df)
@@ -285,40 +383,90 @@ class ComplexUnitaryDenoisingNet(nn.Module):
             residual=((xp-x_ref.detach()).conj()*(xp-x_ref.detach())).real.sum(-1).mean().sqrt()
             U_repr=1.0-torch.exp(torch.tensor(-2.0,device=dev)*residual)
         else: U_repr=torch.tensor(0.0,device=dev)
-        w=torch.sigmoid(self.w_conv); U_meta=w*U_conv+(1-w)*U_repr
-        # v5.9.8 R2.B: U_hopfield from last Hopfield retrieval confidence
-        u_hop=float(getattr(hopfield,'_last_confidence',0.0)) if hopfield is not None else 0.0
-        # v5.9.8 R2.A: U_epistemic from routing (stored on bank by CFL5Layer)
-        u_epi=float(getattr(bank,'_u_epistemic_last',0.0)) if bank is not None else 0.0
-        # v5.9.8 R2.A+R2.B: composite U_meta_v2 with learned weights
-        w_v2=torch.softmax(self.log_w_meta,dim=0)
-        U_meta_v2=w_v2[0]*U_meta+w_v2[1]*u_epi+w_v2[2]*u_hop
-        U_meta=U_meta_v2   # replace U_meta with composite (backward compat: default weights degrade gracefully)
-        # v5.9.8 R3.B: Write to rule cache — skip during thinking (v6.0 CTP)
-        # v6.0.7 NR-1: Dual-trigger write + v6.0.6 ARC merge — skip during thinking
-        if self.episodic_rule_n>0 and not self._in_thinking_mode:
-            U_meta_f=float(U_meta_v2.item()) if isinstance(U_meta_v2,torch.Tensor) else float(U_meta_v2)
-            U_epi_f =float(getattr(bank,'_last_u_epi',0.0) if bank is not None else 0.0)  # v6.0.9: bank not self
-            # Trigger A (escape resolved): h_pre_escape set + U_meta<0.3
+        w=torch.sigmoid(self.w_conv); _U_meta_base=w*U_conv+(1-w)*U_repr  # noqa: F841 — used via U_repr in precision
+
+        u_hop = float(getattr(hopfield,'_last_confidence',0.0)) if hopfield is not None else 0.0
+        u_epi = float(getattr(bank,'_u_epistemic_last',0.0)) if bank is not None else 0.0
+
+        # §1.34 R3+: U_hypo fifth signal
+        u_hypo_f = float(u_hypo)
+        if (bank is not None and getattr(bank,'_in_hypo_mode',False)
+                and bank._r_lista_hypo is not None):
+            diff_sq = float((bank._r_lista_hypo - self.r_lista).norm()**2)
+            u_hypo_f = float(torch.sigmoid(torch.tensor(diff_sq / max(self.d_r_lista, 1))).item())
+
+        # §1.58: Precision-weighted U_meta (replaces log_w_meta softmax)
+        u_temp_f = float(getattr(self,'_last_u_temporal', u_temporal))
+        raw_signals = [
+            float(U_repr.item()) if isinstance(U_repr, torch.Tensor) else float(U_repr),
+            u_epi,
+            u_hop,
+            u_temp_f,
+            u_hypo_f,
+        ]
+        # Update precision from signal variance (EMA)
+        for _s, val in enumerate(raw_signals):
+            if abs(val) > 1e-6:
+                self._precision_active[_s] = True
+            if not self._precision_active[_s]:
+                continue
+            self.sigma_sq_buffer[_s] = 0.95 * self.sigma_sq_buffer[_s] + 0.05 * val**2
+            lp = -0.5 * math.log(self.sigma_sq_buffer[_s] + 1e-6)
+            self.log_precision[_s] = max(-3.0, min(3.0, lp))
+        prec = torch.exp(torch.tensor(self.log_precision, dtype=torch.float32, device=dev))
+        signals_t = torch.tensor(raw_signals, dtype=torch.float32, device=dev)
+        U_meta = (prec * signals_t).sum() / (prec.sum() + 1e-8)
+
+        # §1.52 PLAN-B: Lyapunov timeout per SSP depth
+        if (in_think and len(self._goal_stack) > 0 and r_lista_goal is not None
+                and r_lista_goal.norm() > 1e-4):
+            n_stuck = 12  # ssp_stuck_threshold (from cfg when available)
+            if len(self._stuck_count) < len(self._goal_stack):
+                self._stuck_count.extend([0]*(len(self._goal_stack)-len(self._stuck_count)))
+                self._v_prev.extend([1e9]*(len(self._goal_stack)-len(self._v_prev)))
+            V_curr = float((self.r_lista - r_lista_goal).norm()**2)
+            if V_curr >= self._v_prev[-1]:
+                self._stuck_count[-1] += 1
+            else:
+                self._stuck_count[-1] = 0
+            self._v_prev[-1] = V_curr
+            if self._stuck_count[-1] >= n_stuck and self._goal_stack:
+                parent = self._goal_stack.pop()
+                self._stuck_count.pop(); self._v_prev.pop()
+                with torch.no_grad(): self.r_lista.copy_(parent)
+
+        # §1.31 R2 + NR-1: dual-key ARC write — SUPPRESSED during HYPO (§1.32)
+        _in_hypo = bank is not None and getattr(bank, '_in_hypo_mode', False)
+        if self.episodic_rule_n>0 and not self._in_thinking_mode and not _in_hypo:
+            U_meta_f = float(U_meta.item()) if isinstance(U_meta, torch.Tensor) else float(U_meta)
+            U_epi_f  = float(getattr(bank,'_last_u_epi',0.0) if bank is not None else 0.0)
             trig_A = h_pre_escape is not None and U_meta_f<0.3
-            # Trigger B (novelty resolved): uncertain input but good resolution
             trig_B = U_epi_f>0.6 and U_meta_f<0.4
             if trig_A or trig_B:
                 with torch.no_grad():
-                    K_new=(x_c.mean(0)@self.U1.conj().T.detach()).detach()
-                    V_new=h.mean(0).detach()
-                    n_r=self._rule_cache_n
+                    K_concept_new = (x_c.mean(0)@self.U1.conj().T.detach()).detach()
+                    # §1.31: relational key from phi_rel cache
+                    if _phi_rel is not None:
+                        phi_q = _phi_rel
+                        k_rel_new = (phi_q.mean(0) if phi_q.dim()>1 else phi_q)
+                        if k_rel_new.shape[0] != d_c:
+                            k_rel_new = torch.zeros(d_c, dtype=torch.cfloat, device=dev)
+                    else:
+                        k_rel_new = K_concept_new
+                    K_new = torch.cat([K_concept_new, k_rel_new], dim=0)  # (2*d_c,)
+                    V_new = h_N.mean(0).detach()
+                    n_r   = self._rule_cache_n
                     if n_r>0:
-                        K_r=self.rule_K[:n_r]
-                        sims_w=(K_new@K_r.conj().T).real/(K_new.norm().clamp(1e-8)*K_r.norm(dim=-1).clamp(1e-8)+1e-8)
-                        best_sim,best_i=sims_w.max(0)
-                        if float(best_sim.item())>0.7:   # ARC merge into existing rule
+                        K_r_con = self.rule_K[:n_r,:d_c]
+                        sims_w = (K_concept_new@K_r_con.conj().T).real/(
+                            K_concept_new.norm().clamp(1e-8)*K_r_con.norm(dim=-1).clamp(1e-8)+1e-8)
+                        best_sim,best_i = sims_w.max(0)
+                        if float(best_sim.item())>0.7:
                             self.rule_K[best_i]=0.7*self.rule_K[best_i]+0.3*K_new
                             self.rule_V[best_i]=0.7*self.rule_V[best_i]+0.3*V_new
                             self.rule_util[best_i]+=0.5
-                        else:                             # write new rule (QWR eviction)
-                            ptr=(int(self.rule_util[:n_r].argmin().item()) if n_r>=self.episodic_rule_n
-                                 else n_r)
+                        else:
+                            ptr=(int(self.rule_util[:n_r].argmin().item()) if n_r>=self.episodic_rule_n else n_r)
                             self.rule_K[ptr]=K_new; self.rule_V[ptr]=V_new
                             self.rule_util[ptr]=0.0
                             self._rule_cache_n=min(self.episodic_rule_n,n_r+1)
@@ -326,27 +474,13 @@ class ComplexUnitaryDenoisingNet(nn.Module):
                         self.rule_K[0]=K_new; self.rule_V[0]=V_new
                         self.rule_util[0]=0.0; self._rule_cache_n=1
                     self.rule_ptr.add_(1)
-        self._last_warm_norm=float(warm.norm(dim=-1).mean().item())   # v5.9.6: mean over B
-        self._last_u_temporal=u_temporal   # v6.0.7 MC-3: cached for MC-2 signal
-        self._prev_U_meta=float(U_meta.item()) if isinstance(U_meta,torch.Tensor) else float(U_meta)  # v5.9.6 I1
-        # v6.0.7 MC-2: session-adaptive log_w_rec update (uses U_hopfield as CE proxy)
-        # U_hopfield high → content hard to recall → high difficulty proxy
-        if hasattr(self,'_log_w_rec') and len(self._log_w_rec)==4:
-            u_hop_f=float(u_hop)
-            u_epi_cal_f=float(getattr(bank,'_last_u_epi',0.5) if bank else 0.5)
-            ce_proxy=float(self._prev_U_meta) if hasattr(self,'_prev_U_meta') else 0.5
-            # v6.0.9: prev U_meta as difficulty proxy (avoids self-reinforcing bias
-            # that occurs when ce_proxy==U_hopfield → signal[hopfield]=1.0 always)
-            u_signals=[float(U_repr) if not isinstance(U_repr,float) else U_repr,
-                       u_epi_cal_f,
-                       u_hop_f,
-                       float(getattr(self,'_last_u_temporal',0.0))]
-            for k in range(4):
-                signal_k=1.0-abs(u_signals[k]-ce_proxy)    # agreement between U[k] and difficulty
-                self._log_w_rec[k]=0.95*self._log_w_rec[k]+0.05*signal_k
-        return x_ref,h,{'U_conv':U_conv,'U_repr':U_repr,'U_meta':U_meta,
-                          'escaped':_escaped,'delta_k':deltas,
-                          'warm_start_norm':self._last_warm_norm}
+
+        self._last_warm_norm = float(warm.norm(dim=-1).mean().item())
+        self._last_u_temporal = u_temporal
+        self._prev_U_meta = float(U_meta.item()) if isinstance(U_meta,torch.Tensor) else float(U_meta)
+        return x_ref, h_N, {'U_conv':U_conv,'U_repr':U_repr,'U_meta':U_meta,
+                              'escaped':_escaped,'delta_k':deltas,
+                              'warm_start_norm':self._last_warm_norm}
 
     def forward(self,x_c,c_noise):
         sig=torch.exp(4*c_noise.float().clamp(-10,10))

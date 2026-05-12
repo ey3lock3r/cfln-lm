@@ -34,3 +34,13 @@ class MuonOptimizer:
     def zero_grad(self):
         for _,param in self.params:
             if param.grad is not None: param.grad=None
+
+    def state_dict(self):
+        return {k: v.cpu() for k, v in self._buf.items()}
+
+    def load_state_dict(self, state):
+        device = next(
+            (p.device for _, p in self.params if p.device.type != 'cpu'),
+            torch.device('cpu')
+        )
+        self._buf = {k: v.to(device) for k, v in state.items()}

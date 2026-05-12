@@ -85,6 +85,11 @@ def generate_cfln_ctp(model, prompt_ids,
         f'THINK_END_ID must be THINK_START_ID+1 (got {model.THINK_END_ID} vs {model.THINK_START_ID}+1)')
     THINK_START = model.THINK_START_ID
     THINK_END = model.THINK_END_ID
+    # §2.8 HYPO + §2.9 SSP: detect special tokens if registered (v9.0)
+    _HYPO_START = int(getattr(model, '_hypo_start_id', torch.tensor(-1)).item())
+    _HYPO_END   = int(getattr(model, '_hypo_end_id',   torch.tensor(-1)).item())
+    _PUSH_GOAL  = int(getattr(model, '_push_goal_id',  torch.tensor(-1)).item())
+    _POP_GOAL   = int(getattr(model, '_pop_goal_id',   torch.tensor(-1)).item())
     model.training = False   # avoid recursion from shared submodule refs in model.eval()
     device = prompt_ids.device
     model.reset_for_inference()
@@ -135,6 +140,26 @@ def generate_cfln_ctp(model, prompt_ids,
 
                 if (think_tok == THINK_END).all():
                     break
+
+                # §2.8 HYPO dispatch — per generated token during think loop
+                _ttok0 = int(think_tok[0].item())
+                if _HYPO_START >= 0 and _ttok0 == _HYPO_START:
+                    model.bank._in_hypo_mode = True
+                    _cun = model.diff_aux.cun
+                    model.bank._r_lista_hypo = _cun.r_lista.detach().clone()
+                    model.bank._g_c_hypo = model.bank.g_c.detach().clone()
+                elif _HYPO_END >= 0 and _ttok0 == _HYPO_END:
+                    model.bank._in_hypo_mode = False
+                    model.bank._r_lista_hypo = None
+                # §2.9 SSP dispatch — PUSH/POP goal tokens
+                elif _PUSH_GOAL >= 0 and _ttok0 == _PUSH_GOAL:
+                    _cun = model.diff_aux.cun
+                    _cun._goal_stack.append(_cun.r_lista.detach().clone())
+                elif _POP_GOAL >= 0 and _ttok0 == _POP_GOAL:
+                    _cun = model.diff_aux.cun
+                    if _cun._goal_stack:
+                        _cun._goal_stack.pop()
+
                 # v6.0.1 C2: removed redundant model(think_tok) call.
                 # Next iter's model(generated[:,-1:]) processes think_tok as new last token.
                 # Saves n_think forward passes (was 2× per thinking token → now 1×).

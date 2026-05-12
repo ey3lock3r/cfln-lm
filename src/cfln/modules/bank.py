@@ -25,12 +25,15 @@ class CFBank(nn.Module):
 
     def __init__(self, n_l, n_p, d_c, d_e_l=32, d_e_p=64,  # v6.0.8: n_g, d_e_g removed
                  D_g=8, K_hebb=16, d_r_node=8, rho_node=0.95,
-                 n_heads_gat=4, **kwargs):   # v5.9.6: **kwargs for rho_fast/mid/slow
+                 n_heads_gat=4, K_L1=128, K_L2=32, K_L3=32, C_chunk=32,
+                 n_roles=8, **kwargs):   # v5.9.6: **kwargs for rho_fast/mid/slow
         super().__init__()
         N=self.N_MAX_L
         self.n_l=n_l; self.n_p=n_p  # v6.0.8: self.n_g removed
         self.d_c=d_c; self.d_e_l=d_e_l; self.d_e_p=d_e_p
         self.D_g=D_g; self.alpha_freeze=0.7; self.d_r_node=d_r_node
+        self.K_L1=K_L1; self.K_L2=K_L2; self.K_L3=K_L3; self.C_chunk=C_chunk
+        self.n_roles=n_roles; self.N_max_l=N
 
         # LOCAL TIER
         W_l_init=torch.zeros(N,d_e_l,d_c,dtype=torch.cfloat)
@@ -108,6 +111,59 @@ class CFBank(nn.Module):
         self.register_buffer('H_seq_mat',
             torch.zeros(K_hebb, K_hebb, dtype=torch.float32))   # (K_hebb,K_hebb) transition counts
 
+        # ── v9.0 / v7.0 additions ────────────────────────────────────────────
+
+        # §1.30 R1: phase binding weight
+        self.log_lam_bind = nn.Parameter(torch.tensor(-3.0))
+        # §1.41 W2: learned kernel width (replaces fixed σ=1)
+        self.log_sigma_bind = nn.Parameter(torch.tensor(math.log(2.0)))
+        # §1.33 R4: goal-anchored context register
+        self.register_buffer('g_c', torch.zeros(d_c, dtype=torch.cfloat))
+        self.W_goal_detect = nn.Parameter(torch.zeros(1, d_c))       # real (1, d_c)
+        self.log_lam_goal  = nn.Parameter(torch.tensor(-3.0))
+        # §1.33 R4: HYPO session state (plain Python attrs, not buffers)
+        self._in_hypo_mode   = False
+        self._r_lista_hypo   = None
+        self._u_hypo         = 0.0
+        # §1.39: SSP goal-freeze flag — set True by PUSH_GOAL, cleared by POP_GOAL/reset
+        self._goal_frozen    = False
+        # §1.31 R2: relational eigenvector cache — populated by CFL5Layer, read by lista_forward
+        self._phi_rel_cache  = None
+        # §1.35 X: role binding
+        _rv = torch.randn(n_roles, d_c, 2)  # real/imag components
+        _rv = _rv / _rv.norm(dim=-1, keepdim=True).clamp(1e-8)
+        role_vecs_init = torch.complex(_rv[..., 0], _rv[..., 1]).to(torch.cfloat)
+        # QR-orthonormalise rows if n_roles <= d_c
+        if n_roles <= d_c:
+            _q, _ = torch.linalg.qr(role_vecs_init.T)  # (d_c, n_roles)
+            role_vecs_init = _q.T[:n_roles]             # (n_roles, d_c)
+        self.role_vecs     = nn.Parameter(role_vecs_init)
+        self.log_lam_role  = nn.Parameter(torch.tensor(-3.0))
+        # §1.55 COMP-H: Hadamard composition weight
+        self.log_lam_composition = nn.Parameter(torch.tensor(-3.0))
+        # §1.36 Y1: verbatim span token IDs
+        self.register_buffer('buf_L1_ids',
+            torch.zeros(K_L1, C_chunk, dtype=torch.int32))
+        # §1.59 VQ-Telescope: full routing weight vectors per level
+        self.register_buffer('buf_L1_w_full', torch.zeros(K_L1, N, dtype=torch.float32))
+        self.register_buffer('buf_L2_w_full', torch.zeros(K_L2, N, dtype=torch.float32))
+        self.register_buffer('buf_L3_w_full', torch.zeros(K_L3, N, dtype=torch.float32))
+        # Pointer for VQ-Telescope (plain int; not a buffer — doesn't need checkpointing)
+        self._L1_ptr = 0
+        # §1.43 SE-1: k-shot centroid refinement buffers
+        self.register_buffer('_proto_count', torch.zeros(N, dtype=torch.int32))
+        self.register_buffer('_proto_sum',   torch.zeros(N, d_c, dtype=torch.cfloat))
+        # §1.63 C1: Fisher-based per-unit freeze threshold
+        self.register_buffer('fisher_unit', torch.zeros(N, dtype=torch.float32))
+        # §1.72 C9: learned MC-1 calibration scale (replaces fixed 0.15; init preserves behaviour)
+        self.log_cal_scale = nn.Parameter(torch.tensor(math.log(0.15)))
+        # §1.68 C6: Welford stats for E_min (spawn/surprise threshold)
+        self._Emin_mean = 0.0
+        self._Emin_var  = 0.0
+        self._Emin_n    = 0
+        # §1.59 OI-7: cache last routing weight vector for VQ retrieval query
+        self._last_s_l_full: 'torch.Tensor|None' = None
+
     def compute_u_epistemic(self, E_l: 'torch.Tensor', s_l: 'torch.Tensor',
                              alpha: float=2.0) -> float:
         """v5.9.8 R2.A: Epistemic uncertainty from routing energy and entropy.
@@ -135,7 +191,8 @@ class CFBank(nn.Module):
             self._u_epi_mu =0.99*self._u_epi_mu  + 0.01*u_raw
             self._u_epi_var=0.99*self._u_epi_var + 0.01*(u_raw-_old_mu)**2  # use OLD mu
             u_std=float(self._u_epi_var**0.5)+1e-6
-        u_cal=float(torch.sigmoid(torch.tensor((u_raw-float(self._u_epi_mu))/u_std*0.15+0.5)).item())
+        _cal_scale = float(torch.exp(self.log_cal_scale).item())
+        u_cal=float(torch.sigmoid(torch.tensor((u_raw-float(self._u_epi_mu))/u_std*_cal_scale+0.5)).item())
         self._u_epistemic_last=u_cal
         self._last_u_epi=u_cal   # v6.0.7: for NR-1 trigger B in lista_forward
         return u_cal
@@ -222,6 +279,13 @@ class CFBank(nn.Module):
         """Full reset. Called at document boundaries and definite domain shifts."""
         self.rho_l.zero_()
         self._prev_sel_l=None   # v6.0.3 C2: prevent cross-document H_seq contamination
+        # v9.0: clear goal register and HYPO state
+        self.g_c.zero_()
+        self._in_hypo_mode = False
+        self._r_lista_hypo = None
+        self._u_hypo = 0.0
+        self._goal_frozen = False
+        self._phi_rel_cache = None
 
     @torch.no_grad()
     def attenuate_reservoir(self, factor: float):

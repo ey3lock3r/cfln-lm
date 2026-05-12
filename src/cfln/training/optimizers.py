@@ -10,13 +10,19 @@ def build_optimizers_v605(model, cfg):
       W_enc_res is now a fixed buffer (v5.9.5 B8) — not trained, excluded from Muon.
     - muon_diff: picks up W_rs (d_c×d_r_lista) from diff_aux.cun via is_matrix check.
       W_ri is now a fixed buffer (v5.9.5) — excluded automatically.
-      W_rc_bridge is now a fixed buffer (v5.9.7 C3) — removed from Muon.
+      W_rc_bridge is nn.Parameter (v9.0 §1.50); trained via L_bridge; excluded from Muon.
     - opt_g: picks up log_hop_blend (scalar) automatically via diff_aux.named_parameters.
     - opt_g: log_beta_rs (scalar in diff_aux.cun) picked up automatically.
     - opt_u: adds log_scale_l (per-unit temporal influence scale) alongside log_alp_l.
     """
-    stiefel_ids={id(model.bank.W_l),id(model.bank.W_p),  # v6.0.8: W_g removed
-                  id(model.diff_aux.cun.U1),id(model.diff_aux.cun.U2)}
+    # muon_exclude_ids: blocked from Muon groups (Stiefel + AdamW-only params)
+    muon_exclude_ids={id(model.bank.W_l),id(model.bank.W_p),  # v6.0.8: W_g removed
+                       id(model.diff_aux.cun.U1),id(model.diff_aux.cun.U2),
+                       id(model.bank.role_vecs),   # §1.35 X: non-square (R,d_c) → AdamW only
+                       id(model.W_rc_bridge)}      # §1.50: ESN design → AdamW only
+    # adamw_exclude_ids: blocked from ALL optimizers (true Stiefel/fixed params only)
+    adamw_exclude_ids={id(model.bank.W_l),id(model.bank.W_p),
+                        id(model.diff_aux.cun.U1),id(model.diff_aux.cun.U2)}
     # Pre-reserve unit-tier and persistent-tier param IDs so that sweeping
     # refine.named_parameters() / cfl_layers (which share bank) does NOT
     # claim them for muon/g1.  They are explicitly added to g2/g3 below.
@@ -30,11 +36,11 @@ def build_optimizers_v605(model, cfg):
     seen=_unit_reserved | _pers_reserved
     def is_matrix(p): return p.dim()>=2 and min(p.shape)>=4
     def add_m(name,p,grp):
-        if id(p) not in seen and id(p) not in stiefel_ids and p.requires_grad:
+        if id(p) not in seen and id(p) not in muon_exclude_ids and p.requires_grad:
             seen.add(id(p)); grp.append((name,p)); return True
         return False
     def add_g(p,grp):
-        if p is not None and id(p) not in seen and id(p) not in stiefel_ids and p.requires_grad:
+        if p is not None and id(p) not in seen and id(p) not in adamw_exclude_ids and p.requires_grad:
             seen.add(id(p)); grp.append(p); return True
         return False
 
@@ -50,9 +56,7 @@ def build_optimizers_v605(model, cfg):
         if p is not None: add_m(f'bank.{n}',p,muon_params)
     for n,p in model.highway.named_parameters():
         if is_matrix(p): add_m(f'highway.{n}',p,muon_params)
-    for n in ['W_compress_L1','W_compress_L2','W_compress_L3']:
-        p=getattr(model,n,None)
-        if p is not None: add_m(n,p,muon_params)
+    # W_compress_L1/L2/L3 removed (v9.0 VQ-Telescope §1.59)
     add_m('W_gate_mem',model.W_gate_mem,muon_params)
     for n,p in model.sti_head.named_parameters():
         if is_matrix(p): add_m(f'sti_head.{n}',p,muon_params)
@@ -60,14 +64,13 @@ def build_optimizers_v605(model, cfg):
                         momentum=cfg.get('muon_momentum',0.95),ns_steps=cfg.get('muon_ns_steps',5))
 
     muon_diff_params=[]
-    # W_rc_bridge: now a fixed buffer (v5.9.7 C3) — removed from Muon
-    # (had zero gradient in v5.9.6 — was inside no_grad block, same bug as W_ri pre-v5.9.5)
+    # W_rc_bridge: nn.Parameter (v9.0 §1.50) — in muon_exclude_ids → excluded from Muon, goes to opt_g
     for n,p in model.diff_aux.named_parameters():
         # v5.9.5: W_ri is fixed buffer (excluded); W_rs is parameter and is picked up
-        if is_matrix(p) and id(p) not in stiefel_ids:
+        if is_matrix(p) and id(p) not in muon_exclude_ids:
             add_m(f'diff_aux.{n}',p,muon_diff_params)
     for n,p in model.refine.named_parameters():
-        if is_matrix(p) and id(p) not in stiefel_ids:
+        if is_matrix(p) and id(p) not in muon_exclude_ids:
             add_m(f'refine.{n}',p,muon_diff_params)
     muon_diff=MuonOptimizer(muon_diff_params,
                              lr=cfg.get('lr_muon_diff',cfg.get('lr_muon',1e-3)*0.1),
@@ -86,13 +89,15 @@ def build_optimizers_v605(model, cfg):
             if not is_matrix(p): add_g(p,g1)
     add_g(model.w_outer_gate,g1)
     add_g(model.w_commit,g1)   # v6.0.1 C4: DCG+ commit score calibration (3 scalars) → opt_g
+    add_g(model.bank.role_vecs,g1)  # §1.35 X: (R,d_c) AdamW only; is_matrix=True so not swept above
+    add_g(model.W_rc_bridge,g1)     # §1.50: W_rc_bridge is nn.Parameter, trained via L_bridge
     add_g(model.encoder.titans.log_null_threshold,g1)
     add_g(model.encoder.titans.log_domain_threshold,g1)
     for n,p in model.highway.named_parameters():
         if not is_matrix(p): add_g(p,g1)
     for n,p in model.diff_aux.named_parameters():
         # log_beta_rs, log_w_meta, W_cache_gate, log_cache_gate_bias picked up automatically
-        if id(p) not in stiefel_ids and not is_matrix(p): add_g(p,g1)
+        if id(p) not in muon_exclude_ids and not is_matrix(p): add_g(p,g1)
     for n,p in model.refine.named_parameters():
         if not is_matrix(p): add_g(p,g1)
     opt_g=torch.optim.AdamW(g1,lr=cfg.get('lr_local',3e-4),weight_decay=0.01,betas=(0.9,0.999))  # v6.0.8: lr_global removed

@@ -16,7 +16,23 @@ Behavioral guidelines for this project. Merge with Karpathy-style LLM coding dis
 - Continual learning stack: SI (synaptic intelligence) + alpha_freeze + domain detection
 - Fourier reservoir nodes + LISTA session reservoir
 
-Spec source: `docs/CFLN_v609_Master_Spec.md` — this is the single authoritative document.
+Spec source: `docs/CFLN_Master_Spec.md` — this is the single authoritative document (v9.0).
+
+---
+
+## Tool Usage (RTK token savings)
+
+**Always use Bash commands instead of native tools for reading and searching.** RTK intercepts all Bash calls via the PreToolUse hook and strips output down to only what matters (60–96% token savings). Native tools (Read, Grep, Glob) bypass RTK entirely.
+
+| Task | Use this (Bash → RTK) | Not this (native) |
+|---|---|---|
+| Read a file | `Bash(cat file.py)` | Read tool |
+| Search for pattern | `Bash(grep -n "pattern" file.py)` | Grep tool |
+| Find files | `Bash(find src/ -name "*.py")` | Glob tool |
+
+**Exceptions** — keep using native tools for:
+- `Edit` and `Write` — no Bash equivalent
+- Short one-liner reads where RTK overhead exceeds savings
 
 ---
 
@@ -36,6 +52,42 @@ Never use `pip`, `python` directly, or `conda`.
 ---
 
 ## Coding Discipline
+
+### 0. Resolving Ambiguity — Expert Panel Protocol
+
+Before touching any ambiguous code, convene a **virtual expert panel** to reach a grounded decision:
+
+**When to invoke**: any time a fix has multiple plausible interpretations, a spec section is silent on an edge case, a numerical formula could be read two ways, or conflicting signals exist across spec versions.
+
+**Tier 1 — Core panel (always present, every decision):**
+- **ML Researcher** — is the math correct and stable? numerical consequences?
+- **Software Architect** — does this fit the module structure? is there a simpler design?
+- **Spec Author** — what was the original intent? which version introduced this?
+- **Devil's Advocate** — what breaks under this interpretation? what's the failure mode?
+
+**Tier 2 — Domain specialists (invoked when the question touches their area):**
+
+| Specialist | Invoke when touching |
+|---|---|
+| **Numerical Analyst** | complex float stability, gradient magnitudes, clamping/epsilon choices, init scales |
+| **Continual Learning Specialist** | SI omega, Fisher-KL, alpha_freeze, forgetting vs. plasticity tradeoffs, domain detection |
+| **Optimization Theorist** | Stiefel manifold, Cayley retraction, Muon/Newton-Schulz, Wirtinger calculus, lr schedules |
+| **Memory Systems Architect** | CNEP energy routing, Titans M updates, LISTA warm-start, VQ-Telescope, Telescoping FIFO |
+| **GNN / Spectral Expert** | CS-GAT, Chebyshev polynomials, Hermitian adjacency, PSD conditions, W_full binding terms |
+| **PyTorch Internals Expert** | `torch.cfloat` edge cases, conjugate bits, `view_as_real`, gradient hooks, `register_buffer` vs `nn.Parameter` |
+| **Training Dynamics Expert** | loss weight interactions, multi-pass backward ordering, grad clip vs. Fisher accumulation timing |
+
+**Protocol**:
+1. State the ambiguity clearly — quote the exact spec line(s) in question.
+2. Identify which Tier 2 specialists are relevant and add them to the panel.
+3. List every plausible interpretation (2–4 options).
+4. Have each panelist weigh in, citing evidence from `docs/CFLN_Master_Spec.md` or code.
+5. Record the **Decision** and **Rationale** in `docs/spec_compliance.md` (or inline comment) before writing any code.
+6. If consensus is impossible, escalate to the user before proceeding.
+
+**Never guess silently** — a wrong silent fix is worse than a visible question.
+
+---
 
 ### 1. Think Before Coding
 
@@ -84,7 +136,7 @@ These must never be violated:
 
 ---
 
-## Key Hyperparameter Defaults (v6.0.9)
+## Key Hyperparameter Defaults (v9.0)
 
 ```python
 d_c      = 256        # complex feature dim
@@ -117,5 +169,5 @@ Numerical tests should verify against closed-form spec formulas (e.g., RQ kernel
 ```
 main.py                   # entry point (stub)
 pyproject.toml            # uv project config
-docs/CFLN_v609_Master_Spec.md  # authoritative spec — read before implementing any component
+docs/CFLN_Master_Spec.md       # authoritative spec (v9.0) — read before implementing any component
 ```

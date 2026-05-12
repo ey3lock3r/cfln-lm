@@ -1,4 +1,4 @@
-"""main.py — CFLN v6.0.9 CLI entry point.
+"""main.py — CFLN v9.0 CLI entry point.
 
 Usage:
     python main.py --train [--config path.json]
@@ -44,6 +44,22 @@ def _make_tiny_cfg(overrides=None):
         'use_escape_refine': False, 'n_layers_diff': 1,
         'lista_min_ratio': 0.25, 'lista_convergence_ratio': 0.5,
         'per_sequence_memory': True, 'domain_check_freq': 100,
+        # ── v7.0 ──────────────────────────────────────────────────────────
+        'arc_dual_key': True, 'use_goal_context': True,
+        # hypo/push/pop IDs assigned at runtime by expand_vocabulary
+        # ── v8.0 ──────────────────────────────────────────────────────────
+        'n_roles': 4, 'tau_consol': 3.0, 'alpha_consol': 0.001,
+        'persist_archive': False, 'ssp_max_depth': 4,
+        'lambda_recon': 0.01, 'psd_apply_every': 10,
+        # ── Addendum SE/Q-BEAM/TS ─────────────────────────────────────────
+        'K_proto_max': 10, 'tau_proto': 0.6, 'alpha_young': 0.1,
+        'p_mask': 0.0, 'lambda_mlm': 0.3, 'beam_B': 2, 'lambda_diversity': 0.01,
+        # ── v9.0 ──────────────────────────────────────────────────────────
+        'lambda_bridge': 0.1, 'lambda_vq': 0.01,
+        'beta_KL': 0.5, 'beta_SI_stiefel': 0.25, 'beta_KL_warmup': 500,
+        'lambda_prec': 0.001, 'lambda_lipschitz': 0.001, 'lambda_sigma_reg': 0.001,
+        'k_l_min': 10, 'k_l_max': 40, 'beam_B_max': 3, 'tau_proto_min': 0.4,
+        'alpha_micro': 0.0001,
     }
     if overrides:
         cfg.update(overrides)
@@ -103,8 +119,8 @@ def run_generate(cfg_path, prompt_text):
     # Set training=False directly on the top-level module
     model.training = False
 
-    # Expand vocabulary to enable CTP thinking tokens
-    model.expand_vocabulary(n_new=2)
+    # Expand vocabulary to enable CTP + HYPO/SSP tokens (v9.0: n_new=6)
+    model.expand_vocabulary(n_new=6)
 
     # Encode prompt as token IDs (character-level for demo)
     if prompt_text:

@@ -1,7 +1,6 @@
 """CFLNConfig — all hyperparameters for CFLN v6.0.9.
 
-Defaults follow §7 of docs/CFLN_v609_Master_Spec.md with v6.0.9 overrides
-from CLAUDE.md (d_c=256, n_l=2112, n_p=128, C_chunk=512, rope_base=5_250_000).
+Defaults follow docs/CFLN_Master_Spec.md (v9.0).
 """
 
 from dataclasses import dataclass, field
@@ -72,13 +71,15 @@ class CFLNConfig:
 
     # ── Sparse code / episodic rule caches ───────────────────────────────
     K_sparse: int = 32              # sparse code cache size (sparse_code_cache_K)
-    N_rules: int = 64               # ARC episodic rule cache size
+    N_rules: int = 256              # ARC episodic rule cache size (v9.0: raised from 64)
 
     # ── Coactivation register ─────────────────────────────────────────────
     K_hebb: int = 16                # coactivation register size
 
     # ── Top-k routing ─────────────────────────────────────────────────────
-    k_l: int = 40                   # top-k local units selected per step
+    k_l: int = 40                   # top-k local units selected per step (legacy; adaptive in v9.0)
+    k_l_min: int = 10               # §1.64 C2: adaptive k_l lower bound
+    k_l_max: int = 40               # §1.64 C2: adaptive k_l upper bound
 
     # ── CRoPE ─────────────────────────────────────────────────────────────
     rope_base: float = 5_250_000.0  # NTK-scaled for 1M-token context
@@ -146,7 +147,35 @@ class CFLNConfig:
     # ── BPTT / misc ───────────────────────────────────────────────────────
     D_bptt: int = 4                 # BPTT depth for OCN
     K_stats: int = 4                # stats buffer size
-    lambda_compress: float = 0.01   # W_compress reconstruction loss
+    lambda_compress: float = 0.001  # VQ reconstruction loss (v9.0 §1.51: 0.001)
+
+    # ── SE-1 k-shot refinement (§1.70 C7) ────────────────────────────────
+    tau_proto_min: float = 0.4      # U_epi_cal gate threshold for SE-1 accumulation
+    K_proto_max: int = 10           # max proto accumulations per young unit
+
+    # ── Fisher-KL continual learning (§1.57) ─────────────────────────────
+    beta_KL: float = 0.5            # Fisher-KL penalty weight
+    beta_KL_warmup: int = 500       # steps before KL penalty activates
+    beta_SI_stiefel: float = 0.25   # §E.2: SI sharpness for Stiefel params (spec: 0.25, not 3.0)
+
+    # ── v9.0 loss weights ─────────────────────────────────────────────────
+    lambda_vq: float = 0.01         # VQ-Telescope commitment loss
+    lambda_bridge: float = 0.1      # L_bridge predictive coding loss
+    lambda_diversity: float = 0.01  # beam anti-collapse diversity loss
+    lambda_lipschitz: float = 0.001 # ROB-L young unit Lipschitz reg
+    lambda_sigma_reg: float = 0.001 # ROB-S learned sigma binding reg
+    lambda_prec: float = 0.001      # precision weighting regularization
+    lambda_mlm: float = 0.3         # SE-2 MDLM masked LM loss
+
+    # ── MDLM (§1.44 SE-2) ────────────────────────────────────────────────
+    p_mask: float = 0.15            # masking probability for MDLM
+
+    # ── Role binding (§1.55) ──────────────────────────────────────────────
+    n_roles: int = 8                # number of role vectors
+
+    # ── Micro-consolidation (§1.54 KA-MC) ────────────────────────────────
+    alpha_micro: float = 0.0001     # per-chunk ARC→CNEP consolidation rate
+    alpha_young: float = 0.1        # activity threshold for "young" unit
 
     # ── Memory threshold dict ─────────────────────────────────────────────
     memory_thresholds: Dict[str, float] = field(default_factory=lambda: {
@@ -157,6 +186,9 @@ class CFLNConfig:
         "r_reset": 0.3,
         "eps_H": 1e-4,
     })
+
+    # ── v9.0 beam search ──────────────────────────────────────────────────────
+    beam_B_max: int = 3             # §1.66: max beam width (B_eff = 1 + prev_U_meta*(B_max-1))
 
     # ── Training stage ────────────────────────────────────────────────────
     stage: int = 0                  # training phase (0 = Phase 0 skeleton)
