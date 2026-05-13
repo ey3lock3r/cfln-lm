@@ -487,18 +487,6 @@ def train_step_v605(batch, model, opts, si, phase, step,
                             cfg.get('memory_thresholds',DEFAULT_MEMORY_THRESHOLDS),  # v5.9.5 D5
                             cached_grad_norms=_cached_w_l_grad_norms,si=si)
 
-    # Batched PSD every psd_apply_every steps (§1.11 I3)
-    _psd_freq=cfg.get('psd_apply_every',10)
-    if step%_psd_freq==0 and step>0:
-        from cfln.utils import apply_psd_to_weight_matrix as _psd_fn
-        _n9l=model.bank.n_l
-        with torch.no_grad():
-            for _pi in range(0,_n9l,64):
-                _sl=slice(_pi,min(_pi+64,_n9l))
-                _W_block=model.bank.W_l.data[_sl]
-                for _wi in range(_W_block.shape[0]):
-                    model.bank.W_l.data[_pi+_wi]=_psd_fn(_W_block[_wi].float()).to(model.bank.W_l.dtype)
-
     mon=model.monitor.step(step,[info[0] for info in all_infos])
     _update_lam_p_corrections(model,mon,cfg)
     si_warmup=cfg.get('si_warmup_steps',1000)
