@@ -148,6 +148,7 @@ def batched_apply_psd(W_list: list, eps: float=1e-6) -> list:
 
 
 def batched_cayley_retraction(W, G, lr):
+    if not torch.isfinite(G).all(): return W
     GWH = G@W.conj().transpose(-1,-2)
     A = GWH-GWH.conj().transpose(-1,-2)
     n,d_e,_ = W.shape
@@ -156,6 +157,7 @@ def batched_cayley_retraction(W, G, lr):
 
 
 def batched_cayley_with_per_unit_lr(W, G, lr):
+    if not torch.isfinite(G).all(): return W
     GWH = G@W.conj().transpose(-1,-2)
     A = GWH-GWH.conj().transpose(-1,-2)
     n,d_e,_ = W.shape
@@ -165,10 +167,10 @@ def batched_cayley_with_per_unit_lr(W, G, lr):
 
 
 def cayley_retraction_single(W, G, lr):
+    if not torch.isfinite(G).all(): return W  # skip update if gradient is NaN/Inf
     GWH = G@W.conj().T
     A = GWH-GWH.conj().T
     I = torch.eye(W.shape[0],dtype=W.dtype,device=W.device)  # noqa: E741
-    # Ridge 1e-6*I prevents singular denominator when A has eigenvalue ~2i/lr
     return torch.linalg.solve(I+(lr/2)*A+1e-6*I,(I-(lr/2)*A)@W)
 
 
@@ -185,6 +187,7 @@ def stiefel_update_all_v51(bank, lr_l=0.001, lr_p=0.0001):
 def stiefel_update_cun(diff_aux, lr):
     for W in [diff_aux.cun.U1, diff_aux.cun.U2]:
         if W.grad is not None:
+            torch.nn.utils.clip_grad_norm_([W], 1.0)  # U1/U2 not in opt_g clip
             W.data.copy_(cayley_retraction_single(W.data, W.grad, lr))
             W.grad=None
 
