@@ -119,8 +119,8 @@ def memory_update_v605(bank, dyn, dormancy, x_c, s_l, a_l_rq,
         ops['pruned']+=n-len(ki)
         dyn.prune(ki,dormancy=dormancy,si=si)  # remaps rho_l and log_scale_l (v5.9.4)
         n=bank.n_l
-    if cached_grad_norms is not None and len(cached_grad_norms)>=n:
-        lg=cached_grad_norms[:n]*(~bank.is_sensory_l[:n]).float()
+    if cached_grad_norms is not None and len(cached_grad_norms)>0:
+        _ng=min(n,len(cached_grad_norms)); lg=cached_grad_norms[:_ng]*(~bank.is_sensory_l[:_ng]).float()
         for idx in (lg>eps_split).nonzero(as_tuple=True)[0][:3].tolist():
             dyn.split(idx); ops['split']+=1
         n=bank.n_l

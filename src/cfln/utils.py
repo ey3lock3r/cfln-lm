@@ -52,6 +52,7 @@ def init_unitary(d: int) -> torch.Tensor:
 
 
 def verify_stiefel(W: torch.Tensor, tol: float=1e-5) -> bool:
+    """Check W @ W† ≈ I for one unit. W must be 2D (d_e, d_c); pass W_l[i] not W_l."""
     I = torch.eye(W.shape[0], dtype=W.dtype, device=W.device)  # noqa: E741
     err = (W @ W.conj().T - I).abs().max()
     return err.item() < tol
