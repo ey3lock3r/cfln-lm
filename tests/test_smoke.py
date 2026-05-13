@@ -17,6 +17,7 @@ from cfln.modules.monitoring import DocumentStreamingContext
 from cfln.training.optimizers import build_optimizers_v605
 from cfln.training.train_step import train_step_v605
 from cfln.utils import verify_stiefel
+from cfln.modules.si import compute_domain_confidence
 
 
 SMOKE_CFG = CFLNConfig(
@@ -143,3 +144,29 @@ def test_smoke_checkpoint_roundtrip(tmp_path):
     with torch.no_grad():
         logits, _, _ = model2(batch['input_ids'], training=False)
     assert not torch.isnan(logits).any(), "NaN after checkpoint round-trip"
+
+
+# ── Fix D: compute_domain_confidence NaN guard ───────────────────────────────
+
+def test_domain_confidence_nan_guard():
+    """Fix D: NaN inputs must return 0.0, not silently propagate NaN."""
+    assert compute_domain_confidence(float('nan'), 1.0) == 0.0
+    assert compute_domain_confidence(1.0, float('nan')) == 0.0
+    assert compute_domain_confidence(float('nan'), float('nan')) == 0.0
+    c = compute_domain_confidence(5.0, 1.0)
+    assert 0.0 <= c <= 1.0, f"Valid inputs must return value in [0,1], got {c}"
+
+
+# ── Fix E: begin_document resets EMA baselines ───────────────────────────────
+
+def test_begin_document_resets_ema_baselines():
+    """Fix E: begin_document must reset EMA baselines to prevent cross-document bleed."""
+    model = CFLNModel(asdict(SMOKE_CFG))
+    model.bank._e_min_ema.fill_(999.0)
+    model.bank._h_route_ema.fill_(999.0)
+    model.bank._ema_delta_bank.fill_(999.0)
+    ctx = DocumentStreamingContext(model)
+    ctx.begin_document()
+    assert (model.bank._e_min_ema == 1.0).all(), "_e_min_ema not reset"
+    assert (model.bank._h_route_ema == 1.0).all(), "_h_route_ema not reset"
+    assert (model.bank._ema_delta_bank <= 1e-5).all(), "_ema_delta_bank not reset"
