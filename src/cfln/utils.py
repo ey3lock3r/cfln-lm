@@ -125,15 +125,11 @@ def compute_direction_angles_complex(mu_c):
 # dirichlet_energy_v53 removed v5.9.5 — unused
 def apply_psd_to_weight_matrix(W, eps=1e-6):
     W_sym = (W+W.T)/2
-    W_sym = W_sym.float()
-    # Temporary ridge for numerical stability of eigh on ill-conditioned matrices
-    # (e.g. near-uniform overlap at training start). Subtracted back so the
-    # output is unaffected for already-PSD inputs.
-    ridge = 1e-4
-    W_sym = W_sym + ridge * torch.eye(W_sym.shape[0], dtype=W_sym.dtype, device=W_sym.device)
-    ev,evec = torch.linalg.eigh(W_sym)
-    ev = ev - ridge  # remove ridge contribution before clamping
-    return (evec * ev.clamp(eps).unsqueeze(0)) @ evec.T
+    # Use float64 for eigh: cuSOLVER on GPU fails with error code 5 on
+    # ill-conditioned float32 matrices (e.g. near-rank-1 overlap at init).
+    # float64 has sufficient precision to converge in all observed cases.
+    ev,evec = torch.linalg.eigh(W_sym.double())
+    return ((evec * ev.clamp(eps).unsqueeze(0)) @ evec.T).to(W.dtype)
 
 
 def batched_apply_psd(W_list: list, eps: float=1e-6) -> list:
