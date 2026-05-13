@@ -95,7 +95,7 @@ class CFLNConfig:
     rho_slow: float = 0.99          # slow mode spectral radius
 
     # ── LISTA session reservoir ────────────────────────────────────────────
-    d_r_lista: int = 64             # LISTA reservoir dim (task spec; spec: d_c//2)
+    d_r_lista: int = 128            # LISTA reservoir dim = d_c//2 per §1.13
     rho_lista: float = 0.99
 
     # ── GAT ───────────────────────────────────────────────────────────────

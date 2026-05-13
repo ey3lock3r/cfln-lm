@@ -35,6 +35,10 @@ class DocumentStreamingContext:
         self.model._pos_offset=0
         self.model.bank.reset_reservoir()                   # NEW v5.9.4: node reservoir
         self.model.diff_aux.cun.reset_lista_reservoir()     # NEW v5.9.4: LISTA reservoir
+        # Reset EMA baselines so U_epistemic/U_temporal from previous doc don't bleed in
+        self.model.bank._e_min_ema.fill_(1.0)
+        self.model.bank._h_route_ema.fill_(1.0)
+        self.model.bank._ema_delta_bank.fill_(1e-6)
         self._active=True; self._chunk_count=0; self._window_count=0
 
     def end_document(self): self._active=False

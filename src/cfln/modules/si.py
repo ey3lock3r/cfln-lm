@@ -109,10 +109,11 @@ class SynapticIntelligence(nn.Module):
         if self._embed_theta_star_real is not None:
             dp_r=model.embed.embed_real.weight.data[unique]-self._embed_theta_star_real[unique].to(g_r.device)
             dp_i=model.embed.embed_imag.weight.data[unique]-self._embed_theta_star_imag[unique].to(g_i.device)
+            # §1.12: displacement-only Ω for non-Stiefel params (embed is AdamW, not Stiefel)
             self._embed_omega_real[unique]=(self.rho_SI*self._embed_omega_real[unique]
-                                             +(1-self.rho_SI)*(g_r*dp_r).abs().sum(-1))
+                                             +(1-self.rho_SI)*dp_r.pow(2).sum(-1))
             self._embed_omega_imag[unique]=(self.rho_SI*self._embed_omega_imag[unique]
-                                             +(1-self.rho_SI)*(g_i*dp_i).abs().sum(-1))
+                                             +(1-self.rho_SI)*dp_i.pow(2).sum(-1))
 
     def save_task_snapshot(self,named_params: dict):
         for n,p in named_params.items(): self.theta_star[n]=p.data.clone().detach()
@@ -190,11 +191,13 @@ def compute_domain_confidence(s_domain_ema: float, tau_dom: float,
     c_m4:     routing diversity drop magnitude (0-1)
     c_drift:  slow drift magnitude scaled to [0,1]
     """
+    import math as _math
     import torch as _torch
+    if _math.isnan(s_domain_ema) or _math.isnan(tau_dom): return 0.0
     c_titans=float(_torch.sigmoid(_torch.tensor((s_domain_ema-tau_dom)*3.0)).item())
     c_m4=min(1.0,float(routing_drop)*2.0)
     c_drift=min(1.0,float(slow_drift_mag)*2.0)
-    return max(c_titans,c_m4*0.8,c_drift*0.6)
+    return float(max(c_titans,c_m4*0.8,c_drift*0.6))
 
 
 class DomainTransitionHandler:

@@ -99,7 +99,8 @@ def entmax15_fast(z: torch.Tensor, dim: int=-1,
 entmax15 = entmax15_fast   # alias
 
 def entmax15_with_floor(z: torch.Tensor, eps: float, dim: int=-1) -> torch.Tensor:
-    return entmax15_fast(z, dim=dim).clamp(min=eps)
+    p = entmax15_fast(z, dim=dim).clamp(min=eps)
+    return p / p.sum(dim=dim, keepdim=True)  # renorm: clamp alone breaks sum-to-≤1
 
 
 # sparsemax() removed v6.0.8 (global tier removed; no longer used)

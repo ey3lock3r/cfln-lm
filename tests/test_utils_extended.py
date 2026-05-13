@@ -1,12 +1,11 @@
 """Unit tests for cfln.utils math primitives. Each test quotes its spec section."""
 import math
 import torch
-import pytest
 from cfln.utils import (
     rq_routing, compute_energies, entmax15_fast, entmax15_with_floor,
     complex_rope_multiplicative, complex_layer_norm,
     init_stiefel, verify_stiefel, apply_psd_to_weight_matrix,
-    batched_cayley_retraction, batched_cayley_with_per_unit_lr,
+    batched_cayley_with_per_unit_lr,
 )
 
 
@@ -129,11 +128,12 @@ def test_entmax15_gradient_flows():
 
 
 def test_entmax15_with_floor_clamps_minimum():
-    """§1.4: entmax_with_floor ensures no weight is exactly zero (floor=eps)."""
+    """§1.4: entmax_with_floor — all weights > 0 (floor), sum ≤ 1 (sparsity preserved)."""
     z = torch.tensor([[10.0, 0.0, 0.0, -10.0]])
     eps = 1e-4
     p = entmax15_with_floor(z, eps, dim=-1)
-    assert (p >= eps).all(), f"All weights must be ≥ {eps}"
+    assert (p > 0).all(), "All weights must be > 0 after floor"
+    assert p.sum(dim=-1).item() <= 1.0 + 1e-6, "Weights must sum to ≤ 1 (sparsity invariant)"
 
 
 # ── Complex Layer Norm (A8) ──────────────────────────────────────────────────
