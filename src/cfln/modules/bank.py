@@ -164,6 +164,11 @@ class CFBank(nn.Module):
         # §1.59 OI-7: cache last routing weight vector for VQ retrieval query
         self._last_s_l_full: 'torch.Tensor|None' = None
 
+    def _apply(self, fn):
+        super()._apply(fn)
+        self.coact_register.to(self.mu_c_l.device)
+        return self
+
     def compute_u_epistemic(self, E_l: 'torch.Tensor', s_l: 'torch.Tensor',
                              alpha: float=2.0) -> float:
         """v5.9.8 R2.A: Epistemic uncertainty from routing energy and entropy.
