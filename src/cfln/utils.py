@@ -152,7 +152,7 @@ def batched_cayley_retraction(W, G, lr):
     A = GWH-GWH.conj().transpose(-1,-2)
     n,d_e,_ = W.shape
     I = torch.eye(d_e,dtype=W.dtype,device=W.device).unsqueeze(0).expand(n,-1,-1)  # noqa: E741
-    return torch.linalg.solve(I+(lr/2)*A,(I-(lr/2)*A)@W)
+    return torch.linalg.solve(I+(lr/2)*A+1e-6*I,(I-(lr/2)*A)@W)
 
 
 def batched_cayley_with_per_unit_lr(W, G, lr):
@@ -161,14 +161,15 @@ def batched_cayley_with_per_unit_lr(W, G, lr):
     n,d_e,_ = W.shape
     I = torch.eye(d_e,dtype=W.dtype,device=W.device).unsqueeze(0).expand(n,-1,-1)  # noqa: E741
     lr_h=(lr/2).view(n,1,1)
-    return torch.linalg.solve(I+lr_h*A,(I-lr_h*A)@W)
+    return torch.linalg.solve(I+lr_h*A+1e-6*I,(I-lr_h*A)@W)
 
 
 def cayley_retraction_single(W, G, lr):
     GWH = G@W.conj().T
     A = GWH-GWH.conj().T
     I = torch.eye(W.shape[0],dtype=W.dtype,device=W.device)  # noqa: E741
-    return torch.linalg.solve(I+(lr/2)*A,(I-(lr/2)*A)@W)
+    # Ridge 1e-6*I prevents singular denominator when A has eigenvalue ~2i/lr
+    return torch.linalg.solve(I+(lr/2)*A+1e-6*I,(I-(lr/2)*A)@W)
 
 
 def stiefel_update_all_v51(bank, lr_l=0.001, lr_p=0.0001):
