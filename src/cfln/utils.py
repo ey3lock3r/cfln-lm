@@ -125,11 +125,13 @@ def compute_direction_angles_complex(mu_c):
 # dirichlet_energy_v53 removed v5.9.5 — unused
 def apply_psd_to_weight_matrix(W, eps=1e-6):
     W_sym = (W+W.T)/2
-    # Use float64 for eigh: cuSOLVER on GPU fails with error code 5 on
-    # ill-conditioned float32 matrices (e.g. near-rank-1 overlap at init).
-    # float64 has sufficient precision to converge in all observed cases.
-    ev,evec = torch.linalg.eigh(W_sym.double())
-    return ((evec * ev.clamp(eps).unsqueeze(0)) @ evec.T).to(W.dtype)
+    # Use SVD instead of eigh: cuSOLVER eigh fails with error code 5 on
+    # near-rank-1 matrices (e.g. near-uniform overlap at training start),
+    # both in float32 AND float64, on GPU. SVD never fails on degenerate
+    # matrices. For symmetric W: singular values = |eigenvalues|, and
+    # U is an orthonormal basis of eigenvectors. PSD projection = clamp S>=eps.
+    U, S, _ = torch.linalg.svd(W_sym.double())
+    return ((U * S.clamp(eps).unsqueeze(0)) @ U.T).to(W.dtype)
 
 
 def batched_apply_psd(W_list: list, eps: float=1e-6) -> list:
