@@ -61,6 +61,8 @@ class CFL5Layer(nn.Module):
                 torch.exp(-E_p/torch.exp(2*bank.log_ell_p))*torch.exp(bank.log_alp_p),dim=-1)
 
         _u_cal = float(getattr(bank, '_u_epistemic_last', 0.5))
+        if _u_cal != _u_cal: _u_cal = 0.5  # NaN guard
+        _u_cal = max(0.0, min(1.0, _u_cal))
         _k_min = int(getattr(bank, 'k_l_min', 20))
         _k_max = int(getattr(bank, 'k_l_max', 60))
         k_l = min(n_l, _k_min + round((_k_max - _k_min) * _u_cal))

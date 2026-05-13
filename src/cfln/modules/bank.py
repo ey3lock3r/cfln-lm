@@ -183,11 +183,13 @@ class CFBank(nn.Module):
         E_min=e_masked.min(dim=-1).values.mean()         # scalar: avg-over-batch min energy
         s_n=s_l[:,:n].clamp(1e-10)
         H_route=(-(s_n*s_n.log()).sum(-1)).mean()        # scalar: avg routing entropy
+        e_min_v=float(E_min.item()); h_route_v=float(H_route.item())
+        if e_min_v!=e_min_v or h_route_v!=h_route_v: return 0.5  # NaN guard
         with torch.no_grad():
-            self._e_min_ema=0.95*self._e_min_ema+0.05*float(E_min.item())  # v6.0.6: 0.99->0.95
-            self._h_route_ema=0.95*self._h_route_ema+0.05*float(H_route.item())
-        e_norm=float(E_min.item())/(float(self._e_min_ema.item())+1e-8)
-        h_norm=float(H_route.item())/(float(self._h_route_ema.item())+1e-8)
+            self._e_min_ema=0.95*self._e_min_ema+0.05*e_min_v  # v6.0.6: 0.99->0.95
+            self._h_route_ema=0.95*self._h_route_ema+0.05*h_route_v
+        e_norm=e_min_v/(float(self._e_min_ema.item())+1e-8)
+        h_norm=h_route_v/(float(self._h_route_ema.item())+1e-8)
         u_raw=float(torch.sigmoid(torch.tensor(alpha*(e_norm*h_norm-1.0))).item())
         # v6.0.7 MC-1: rolling normalisation -> keeps U_epi near [0.35, 0.65]
         with torch.no_grad():
