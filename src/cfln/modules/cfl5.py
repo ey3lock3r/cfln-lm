@@ -107,7 +107,7 @@ class CFL5Layer(nn.Module):
         W_ll=self._get_W_ll(bank,sel_l)
         W_full=W_ll                                            # v6.0.8: no global tier block
         lam_h=torch.exp(self.log_lambda_hebb).clamp(max=0.5)   # v6.0.2 C4: grad flows; v6.0.4 C3: bounded ≤0.5
-        H_mat=bank.coact_register.get_hebbian_matrix(sel_l.cpu()).to(device)
+        H_mat=bank.coact_register.get_hebbian_matrix(sel_l)
         W_ll2=W_full[:k_l,:k_l]+lam_h*H_mat[:k_l,:k_l]
         mx=W_full[:k_l,:k_l].max().clamp(1e-8); W_full=W_full.clone()
         W_full[:k_l,:k_l]=W_ll2/W_ll2.max().clamp(1e-8)*mx

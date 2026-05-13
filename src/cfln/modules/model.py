@@ -134,6 +134,13 @@ class CFLNModel(nn.Module):
         self.cfg = cfg  # keep for v9.0 helpers (micro_consolidate_arc, etc.)
         self._archive_loaded = False  # §1.38 Y3: guard for cross-session archive load
 
+    def _apply(self, fn):
+        super()._apply(fn)
+        dev = next(self.parameters()).device
+        self.telescoping_mem.to(dev)
+        self.surprise_archive.to(dev)
+        return self
+
     def setup_device(self,device: torch.device) -> 'CFLNModel':
         """Move non-Module components to device. CALL AFTER model.to(device)."""
         self.bank.coact_register.to(device)
