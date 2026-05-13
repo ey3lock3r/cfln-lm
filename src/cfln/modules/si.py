@@ -14,13 +14,13 @@ class SynapticIntelligence(nn.Module):
         self.c_SI=c_SI; self.rho_SI=rho_SI; self.beta_SI=beta_SI
         self.theta_star={}; self.omega={}; self.active=False
         self._omega_scales={'sti_head.W_vocab.weight':0.3}
-        self._model_ref=None
+        object.__setattr__(self, '_model_ref', None)  # bypass nn.Module registry to avoid circular child ref
         self._embed_omega_real=None; self._embed_omega_imag=None
         self._embed_theta_star_real=None; self._embed_theta_star_imag=None
         self._embed_omega_scale=0.1
 
     def _get_named_params(self,model) -> dict:
-        self._model_ref=model; protected={}
+        object.__setattr__(self, '_model_ref', model); protected={}
         for n in ['W_c_proj','B_dec_fast']:
             p=getattr(model.encoder,n,None)
             if p is not None: protected[f'encoder.{n}']=p

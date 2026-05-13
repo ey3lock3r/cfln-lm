@@ -297,7 +297,7 @@ class CFBank(nn.Module):
 
     @torch.no_grad()
     def update_activation_freq(self, s_l, decay=0.995):
-        n=self.n_l; active=(s_l.mean(0)[:n]>1.0/n).float()
+        n=min(self.n_l, s_l.shape[-1]); active=(s_l.mean(0)[:n]>1.0/n).float()
         self.activation_freq_l[:n]=(decay*self.activation_freq_l[:n]+(1-decay)*active)
         self.coact_register.update(s_l[:,:n],threshold=1.0/n)
 
