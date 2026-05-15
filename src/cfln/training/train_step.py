@@ -320,20 +320,37 @@ def train_step_v605(batch, model, opts, si, phase, step,
     # ── v9.0 auxiliary losses ──────────────────────────────────────────────
     _bank=model.bank; _cun=model.diff_aux.cun
 
+    # DEBUG: scan for stale cross-step grad_fn nodes before adding to L_pass1
+    def _dbg_check(name, t):
+        if t is None or not isinstance(t, torch.Tensor) or not t.requires_grad: return
+        try: t.sum().backward(retain_graph=True)
+        except RuntimeError as _e:
+            if 'freed' in str(_e) or 'second time' in str(_e):
+                print(f'[STALE GRAPH] {name} has freed grad_fn! val={float(t.detach().mean()):.4f}')
+                raise
+        finally:
+            # zero out any grads we just computed to avoid polluting real backward
+            for pg in opt_g.param_groups:
+                for p in pg['params']:
+                    if p.grad is not None: p.grad = None
+
     # L_bridge (§1.50) — _last_L_bridge is set on model by _update_telescoping, not on cfl_layers
     _lb=getattr(model,'_last_L_bridge',None)
     if _lb is not None and isinstance(_lb,torch.Tensor) and _lb.requires_grad:
+        _dbg_check('_last_L_bridge', _lb)
         L_pass1=L_pass1+cfg.get('lambda_bridge',0.1)*_lb
 
     # L_vq VQ commitment (§1.59) — _L_compress_accum sums L_vq across ALL chunks in forward()
     _lvq=model._L_compress_accum
     if _lvq is not None and isinstance(_lvq,torch.Tensor) and _lvq.requires_grad:
+        _dbg_check('_L_compress_accum', _lvq)
         L_pass1=L_pass1+cfg.get('lambda_vq',0.01)*_lvq
     model._L_compress_accum=None  # clear after use
 
     # L_diversity beam anti-collapse (§1.47)
     _ldiv=getattr(_cun,'_last_beam_diversity',None)
     if _ldiv is not None and isinstance(_ldiv, torch.Tensor):
+        _dbg_check('_last_beam_diversity', _ldiv)
         L_pass1=L_pass1+cfg.get('lambda_diversity',0.01)*(-_ldiv**2)
 
     # ROB-L Lipschitz young units (§1.56)
@@ -363,6 +380,10 @@ def train_step_v605(batch, model, opts, si, phase, step,
                 _dr=_d.real if _kp.is_complex() else _d
                 _L_KL=_L_KL+(model._fisher_diag[_fid]*_dr.pow(2)).sum()
         L_pass1=L_pass1+_kl_w*_L_KL
+
+    # DEBUG: check L_null separately
+    if _null_raw is not None and _null_raw.requires_grad:
+        _dbg_check('_null_aux_loss (via L_null)', L_null)
 
     # SE-2 MDLM masking (§1.44): stash params for a separate backward AFTER L_pass1
     _mdlm_mid=None
