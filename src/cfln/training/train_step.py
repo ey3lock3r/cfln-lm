@@ -374,9 +374,11 @@ def train_step_v605(batch, model, opts, si, phase, step,
         _mpos=torch.bernoulli(torch.full((B,T),_pm,device=input_ids.device)).bool()
         if _mpos.any():
             _mid=input_ids.clone(); _mid[_mpos]=_mtok
-            # Clear W_ll cache before second forward: cache holds grad_fn nodes from
-            # the first forward; reusing them causes "backward through graph twice" error.
+            # Isolate second forward from first-forward graph nodes.
+            # _W_ll_cache and sti_head._ocn_hist hold live grad_fn nodes; reusing
+            # them across two backwards causes "backward through graph twice".
             for _layer in model.cfl_layers: _layer._W_ll_cache.clear()
+            model.sti_head.reset()
             _lm,_,_=model(_mid,training=False)
             _tgtm=input_ids.reshape(-1).clone(); _tgtm[~_mpos.reshape(-1)]=-100
             _Lmlm=F.cross_entropy(_lm.reshape(-1,_lm.size(-1)),_tgtm,ignore_index=-100)
