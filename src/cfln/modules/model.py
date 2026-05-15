@@ -292,8 +292,8 @@ class CFLNModel(nn.Module):
         if s_l_full is not None and hasattr(bank, 'buf_L1_w_full'):
             L_vq = vq_telescope_update(
                 chunk_mean, s_l_full, E_min_raw,
-                chunk_token_ids if chunk_token_ids is not None else torch.zeros(bank.C_chunk, dtype=torch.int32),
-                bank, sel_l if sel_l is not None else torch.zeros(0, dtype=torch.long),
+                chunk_token_ids if chunk_token_ids is not None else torch.zeros(bank.C_chunk, dtype=torch.int32, device=chunk_mean.device),
+                bank, sel_l if sel_l is not None else torch.zeros(0, dtype=torch.long, device=chunk_mean.device),
                 self.cfg
             )
             bank._last_L_vq = L_vq
