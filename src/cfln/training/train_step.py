@@ -23,8 +23,10 @@ def stiefel_update_v58(bank, si, lr_stiefel, beta_SI=3.0):
 
 
 def stiefel_update_cun(diff_aux, lr):
+    import torch.nn as _nn
     for W in [diff_aux.cun.U1, diff_aux.cun.U2]:
         if W.grad is not None:
+            _nn.utils.clip_grad_norm_([W], 1.0)  # U1/U2 not in opt_g clip
             W.data.copy_(cayley_retraction_single(W.data, W.grad, lr))
             W.grad=None
 
@@ -174,7 +176,7 @@ def _compute_local_losses(model,input_ids,all_infos,stage,step,opts,cfg,lr_s,pha
         from cfln.utils import normalize_complex_center as _ncc
         mu_n=_ncc(bank.mu_c_l[:n]); cs=(mu_n@mu_n.conj().T).real
         L_div=((cs-torch.eye(n,device=cs.device))**2).mean()*0.001
-    else: L_div=torch.tensor(0.0)
+    else: L_div=torch.tensor(0.0,device=input_ids.device)
     L_total=L_local+L_div
     if L_total.requires_grad: opt_u.zero_grad(); L_total.backward(); opt_u.step()
     return L_local,L_div
@@ -202,16 +204,12 @@ def psc_train_step(batch, model, psc_loss_fn, opts, si, phase, step,
     device=input_ids.device
     # Snapshot r_lista_0 before thinking
     r_lista_0=model.diff_aux.cun.r_lista.detach().clone()
-    # Deterministic thinking: K_psc LISTA steps with fixed THINK_START seed
-    think_emb=model.encoder.embed(
-        torch.tensor([[model.THINK_START_ID]]*B,device=device))[:,0,:]  # (B,d_c)
     model._in_thinking_mode=True
     model.diff_aux.cun._in_thinking_mode=True
     if hasattr(model.encoder,'titans'): model.encoder.titans._in_thinking_mode=True
+    think_ids=torch.full((B,1),model.THINK_START_ID,dtype=input_ids.dtype,device=device)
     for _ in range(K_psc):
-        # Single token LISTA step with think embedding as input
-        think_emb.unsqueeze(1)          # (B,1,d_c)
-        _=model(input_ids[:,:1].fill_(model.THINK_START_ID),training=True)
+        _=model(think_ids,training=True)
     r_lista_K=model.diff_aux.cun.r_lista.clone()  # (d_r_lista,) updated by K steps
     model._in_thinking_mode=False
     model.diff_aux.cun._in_thinking_mode=False
@@ -315,19 +313,17 @@ def train_step_v605(batch, model, opts, si, phase, step,
     ce=F.cross_entropy(logits.reshape(-1,logits.size(-1)),targets.reshape(-1),
                         reduction='none',ignore_index=cfg.get('pad_id',-100)).reshape(B,T-1)
     L_task=ce.mean(); L_SI=si.compute_loss(si_params)
-    L_null=model.encoder.titans._null_aux_loss or torch.tensor(0.0,device=input_ids.device)
+    _null_raw=model.encoder.titans._null_aux_loss
+    L_null=_null_raw if _null_raw is not None else torch.tensor(0.0,device=input_ids.device)
     L_pass1=L_task+L_SI+L_null
 
     # ── v9.0 auxiliary losses ──────────────────────────────────────────────
     _bank=model.bank; _cun=model.diff_aux.cun
 
-    # L_bridge per CFL layer (§1.50)
-    _lb_sum=torch.tensor(0.0,device=input_ids.device)
-    for _lay in model.cfl_layers:
-        _lb=getattr(_lay,'_last_L_bridge',None)
-        if _lb is not None and isinstance(_lb,torch.Tensor) and _lb.requires_grad:
-            _lb_sum=_lb_sum+_lb
-    L_pass1=L_pass1+cfg.get('lambda_bridge',0.1)*_lb_sum
+    # L_bridge (§1.50) — _last_L_bridge is set on model by _update_telescoping, not on cfl_layers
+    _lb=getattr(model,'_last_L_bridge',None)
+    if _lb is not None and isinstance(_lb,torch.Tensor) and _lb.requires_grad:
+        L_pass1=L_pass1+cfg.get('lambda_bridge',0.1)*_lb
 
     # L_vq VQ commitment (§1.59) — _L_compress_accum sums L_vq across ALL chunks in forward()
     _lvq=model._L_compress_accum
@@ -376,10 +372,13 @@ def train_step_v605(batch, model, opts, si, phase, step,
             _mid=input_ids.clone(); _mid[_mpos]=_mtok
             # Isolate second forward from first-forward graph nodes.
             # _W_ll_cache and sti_head._ocn_hist hold live grad_fn nodes; reusing
-            # them across two backwards causes "backward through graph twice".
+            # them causes "backward through graph twice". Save/restore _pos_offset
+            # so the inference-mode advance does not corrupt positional encodings.
             for _layer in model.cfl_layers: _layer._W_ll_cache.clear()
             model.sti_head.reset()
+            _saved_pos=getattr(model,'_pos_offset',0)
             _lm,_,_=model(_mid,training=False)
+            model._pos_offset=_saved_pos
             _tgtm=input_ids.reshape(-1).clone(); _tgtm[~_mpos.reshape(-1)]=-100
             _Lmlm=F.cross_entropy(_lm.reshape(-1,_lm.size(-1)),_tgtm,ignore_index=-100)
             L_pass1=L_pass1+cfg.get('lambda_mlm',0.3)*_Lmlm
