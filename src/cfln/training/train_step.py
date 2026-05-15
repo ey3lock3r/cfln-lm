@@ -58,8 +58,10 @@ def _find_merge_pair(bank, n, eps_merge, approx_sample=64):
         idx=non_sensory[perm[:approx_sample]]
     mu_s=normalize_complex_center(bank.mu_c_l[idx]); cs=(mu_s@mu_s.conj().T).real
     cs.fill_diagonal_(-1.0); mx=cs.max()
-    if mx<=eps_merge: return -1,-1
-    pair=(cs==mx).nonzero()[0]; return idx[pair[0]].item(),idx[pair[1]].item()
+    if not torch.isfinite(mx) or mx<=eps_merge: return -1,-1
+    nz=(cs==mx).nonzero()
+    if nz.shape[0]==0: return -1,-1
+    pair=nz[0]; return idx[pair[0]].item(),idx[pair[1]].item()
 
 
 def _reactivate_from_exemplars(slot, dormancy, bank, dyn, x_rep):
