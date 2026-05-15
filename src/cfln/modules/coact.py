@@ -10,6 +10,12 @@ class CoactivationRegister:
         self._write_ptr = torch.zeros(N_max_l, dtype=torch.long)
         self.decay = 0.995
 
+    def _apply(self, fn):
+        self.coact_reg  = fn(self.coact_reg)
+        self.coact_cnt  = fn(self.coact_cnt)
+        self._write_ptr = fn(self._write_ptr)
+        return self
+
     def to(self, device):
         self.coact_reg  = self.coact_reg.to(device)
         self.coact_cnt  = self.coact_cnt.to(device)
@@ -26,11 +32,19 @@ class CoactivationRegister:
         j_idx = active_idx.unsqueeze(0).expand(k, -1).reshape(-1)
         mask = i_idx != j_idx; i_idx = i_idx[mask]; j_idx = j_idx[mask]
         if len(i_idx) == 0: return
-        wp = self._write_ptr[i_idx] % self.K_hebb
+        # Compute per-pair occurrence offset so each (i, j) pair lands in a distinct slot.
+        # Without this, all j's for the same i share the same wp → only the last survives.
+        counts = torch.zeros(len(i_idx), dtype=torch.long, device=i_idx.device)
+        for pos in range(1, len(i_idx)):
+            counts[pos] = int((i_idx[:pos] == i_idx[pos]).sum())
+        wp = (self._write_ptr[i_idx] + counts) % self.K_hebb
         self.coact_reg[i_idx, wp] = j_idx
         self.coact_cnt[i_idx, wp] = (self.coact_cnt[i_idx, wp].float() + increment).half()
         u_idx = torch.unique(i_idx)
-        self._write_ptr[u_idx] = (self._write_ptr[u_idx] + 1) % self.K_hebb
+        # Advance each unit's pointer by the number of partners written for it this call
+        for uid in u_idx:
+            n_written = int((i_idx == uid).sum().item())
+            self._write_ptr[uid] = (self._write_ptr[uid] + n_written) % self.K_hebb
 
     def get_hebbian_matrix(self, active_idx):
         reg_a = self.coact_reg[active_idx]; cnt_a = self.coact_cnt[active_idx].float()

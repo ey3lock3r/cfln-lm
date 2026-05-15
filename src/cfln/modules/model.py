@@ -136,9 +136,8 @@ class CFLNModel(nn.Module):
 
     def _apply(self, fn):
         super()._apply(fn)
-        dev = next(self.parameters()).device
-        self.telescoping_mem.to(dev)
-        self.surprise_archive.to(dev)
+        self.telescoping_mem._apply(fn)
+        self.surprise_archive._apply(fn)
         return self
 
     def setup_device(self,device: torch.device) -> 'CFLNModel':
@@ -337,7 +336,8 @@ class CFLNModel(nn.Module):
             welford_std = (bank._Emin_var / max(n - 1, 1)) ** 0.5
             surprise_thresh = max(bank._Emin_mean + 2.5 * welford_std, 0.1)
         if E_min_raw > surprise_thresh:
-            self.surprise_archive.add_vq(bank._L1_ptr - 1, E_min_raw)  # §1.68: store pointer+score
+            # pass slot index (% K_L1) so archive stores a valid circular-buffer index
+            self.surprise_archive.add_vq((bank._L1_ptr - 1) % bank.K_L1, E_min_raw)
 
         # §1.54 KA-MC: micro-consolidation per chunk
         micro_consolidate_arc(bank, self.diff_aux.cun, self.cfg)

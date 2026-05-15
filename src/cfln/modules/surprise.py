@@ -13,7 +13,17 @@ class SurpriseArchive:
         self.surprises=torch.zeros(N_archive); self._heap=[]; self._n_filled=0
         self._surprise_history=torch.zeros(N_tau); self._hist_ptr=0; self._hist_fill=0; self._chunk_count=0
 
-    def to(self,device): self.entries=self.entries.to(device); self.surprises=self.surprises.to(device); return self
+    def _apply(self, fn):
+        self.entries=fn(self.entries)
+        self.surprises=fn(self.surprises)
+        self._surprise_history=fn(self._surprise_history)
+        return self
+
+    def to(self,device):
+        self.entries=self.entries.to(device)
+        self.surprises=self.surprises.to(device)
+        self._surprise_history=self._surprise_history.to(device)
+        return self
 
     @torch.no_grad()
     def update_threshold(self,s_t):
@@ -67,7 +77,7 @@ class SurpriseArchive:
                 return False
             self._vq_ptrs.pop(min_idx)
             self._vq_scores.pop(min_idx)
-        self._vq_ptrs.append(buf_ptr)
+        self._vq_ptrs.append(buf_ptr)  # caller must pass slot index (already % K_L1)
         self._vq_scores.append(e_min_raw)
         return True
 
@@ -78,14 +88,13 @@ class SurpriseArchive:
         dev = bank.mu_c_l.device
         n_l = bank.n_l
         best_sim = -float('inf')
-        best_ptr = self._vq_ptrs[0]
-        for ptr in self._vq_ptrs:
-            p = ptr % bank.K_L1
-            sim = float((bank.buf_L1_w_full[p].to(dev) @ s_l_full_query).item())
+        best_slot = self._vq_ptrs[0]
+        for slot in self._vq_ptrs:  # already modded at write time
+            sim = float((bank.buf_L1_w_full[slot].to(dev) @ s_l_full_query).item())
             if sim > best_sim:
                 best_sim = sim
-                best_ptr = p
-        w = bank.buf_L1_w_full[best_ptr, :n_l].unsqueeze(-1).to(torch.cfloat).to(dev)
+                best_slot = slot
+        w = bank.buf_L1_w_full[best_slot, :n_l].unsqueeze(-1).to(torch.cfloat).to(dev)
         return (w * bank.mu_c_l[:n_l]).sum(0)
 
     def retrieve(self,x_c_query,beta=1.0):

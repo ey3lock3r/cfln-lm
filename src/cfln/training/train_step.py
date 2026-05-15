@@ -112,7 +112,7 @@ def memory_update_v605(bank, dyn, dormancy, x_c, s_l, a_l_rq,
     with torch.no_grad():
         act=(s_l.mean(0)>1.0/n).float()
         bank.log_alp_l.data[:n]+=0.01*act[:n]; bank.log_alp_l.data[:n].clamp_(-5,0)
-        bank.update_activation_freq(s_l)
+        # update_activation_freq is called in step-14 maintenance; skip here to avoid double EMA decay
     ops['new_sensory']=bank.update_sensory_mask(cfg.get('sensory_fraction',0.15))
     alpha=torch.exp(bank.log_alp_l[:n]).clamp(1e-6,1.0); rq=a_l_rq.mean(0)[:n]
     sens=bank.is_sensory_l[:n]
@@ -200,25 +200,29 @@ def psc_train_step(batch, model, psc_loss_fn, opts, si, phase, step,
         return {**info,'L_PSC':0.0,'L_improve':0.0,'L_economy':0.0,'L_predictive':0.0}
 
     # ── Pass 2: thinking forward → CE_thinking (differentiable) ──────────
+    # Think steps run AFTER Pass 1 backward is complete so no shared graph nodes.
     model.train(); input_ids=batch['input_ids']; B,T=input_ids.shape
     device=input_ids.device
-    # Snapshot r_lista_0 before thinking
+    # Snapshot r_lista_0 AFTER Pass 1 backward (graph freed); detach is safe.
     r_lista_0=model.diff_aux.cun.r_lista.detach().clone()
     model._in_thinking_mode=True
     model.diff_aux.cun._in_thinking_mode=True
     if hasattr(model.encoder,'titans'): model.encoder.titans._in_thinking_mode=True
     think_ids=torch.full((B,1),model.THINK_START_ID,dtype=input_ids.dtype,device=device)
-    for _ in range(K_psc):
-        _=model(think_ids,training=True)
-    r_lista_K=model.diff_aux.cun.r_lista.clone()  # (d_r_lista,) updated by K steps
+    # Think steps run under no_grad: they only update r_lista state, not the grad graph.
+    # Gradients flow through logits_think (below), not through the think state updates.
+    with torch.no_grad():
+        for _ in range(K_psc):
+            _=model(think_ids,training=True)
+    r_lista_K=model.diff_aux.cun.r_lista.detach().clone()  # features only
     model._in_thinking_mode=False
     model.diff_aux.cun._in_thinking_mode=False
     if hasattr(model.encoder,'titans'): model.encoder.titans._in_thinking_mode=False
-    # Thinking-augmented logits
+    # Thinking-augmented logits: single forward with grad, using updated r_lista state
     logits_think,_,_=model(input_ids,training=True)
     targets=input_ids[:,1:]
     ce_thinking=F.cross_entropy(
-        logits_think[:,:-1].reshape(-1,logits_think.size(-1)),
+        logits_think.reshape(-1,logits_think.size(-1)),
         targets.reshape(-1),reduction='mean',
         ignore_index=cfg.get('pad_id',-100))
 
@@ -242,10 +246,10 @@ def psc_train_step(batch, model, psc_loss_fn, opts, si, phase, step,
     _resolve_opt_grads(opt_g); opt_g.step(); muon.step()
 
     return {**info,
-            'L_PSC':float(L_PSC),
+            'L_PSC':float(L_PSC.detach()),
             'L_improve':float(psc_loss_fn.alpha*
                              (-torch.log(torch.sigmoid(
-                              ce_baseline.detach()-ce_thinking+psc_loss_fn.margin)))),
+                              ce_baseline.detach()-ce_thinking.detach()+psc_loss_fn.margin)))),
             'L_economy':0.0,'L_predictive':0.0}
 
 
@@ -320,37 +324,20 @@ def train_step_v605(batch, model, opts, si, phase, step,
     # ── v9.0 auxiliary losses ──────────────────────────────────────────────
     _bank=model.bank; _cun=model.diff_aux.cun
 
-    # DEBUG: scan for stale cross-step grad_fn nodes before adding to L_pass1
-    def _dbg_check(name, t):
-        if t is None or not isinstance(t, torch.Tensor) or not t.requires_grad: return
-        try: t.sum().backward(retain_graph=True)
-        except RuntimeError as _e:
-            if 'freed' in str(_e) or 'second time' in str(_e):
-                print(f'[STALE GRAPH] {name} has freed grad_fn! val={float(t.detach().mean()):.4f}')
-                raise
-        finally:
-            # zero out any grads we just computed to avoid polluting real backward
-            for pg in opt_g.param_groups:
-                for p in pg['params']:
-                    if p.grad is not None: p.grad = None
-
     # L_bridge (§1.50) — _last_L_bridge is set on model by _update_telescoping, not on cfl_layers
     _lb=getattr(model,'_last_L_bridge',None)
     if _lb is not None and isinstance(_lb,torch.Tensor) and _lb.requires_grad:
-        _dbg_check('_last_L_bridge', _lb)
         L_pass1=L_pass1+cfg.get('lambda_bridge',0.1)*_lb
 
     # L_vq VQ commitment (§1.59) — _L_compress_accum sums L_vq across ALL chunks in forward()
     _lvq=model._L_compress_accum
     if _lvq is not None and isinstance(_lvq,torch.Tensor) and _lvq.requires_grad:
-        _dbg_check('_L_compress_accum', _lvq)
         L_pass1=L_pass1+cfg.get('lambda_vq',0.01)*_lvq
     model._L_compress_accum=None  # clear after use
 
     # L_diversity beam anti-collapse (§1.47)
     _ldiv=getattr(_cun,'_last_beam_diversity',None)
     if _ldiv is not None and isinstance(_ldiv, torch.Tensor):
-        _dbg_check('_last_beam_diversity', _ldiv)
         L_pass1=L_pass1+cfg.get('lambda_diversity',0.01)*(-_ldiv**2)
 
     # ROB-L Lipschitz young units (§1.56)
@@ -370,20 +357,18 @@ def train_step_v605(batch, model, opts, si, phase, step,
 
     # Fisher-KL penalty from previous step (§1.57)
     _bkl_wu=cfg.get('beta_KL_warmup',500)
-    if step>_bkl_wu and hasattr(model,'_fisher_diag') and model._fisher_diag:
+    if step>_bkl_wu and hasattr(model,'_fisher_diag_named') and model._fisher_diag_named:
         _kl_w=cfg.get('beta_KL',0.5)*min(1.0,(step-_bkl_wu)/max(_bkl_wu,1))
         _L_KL=torch.tensor(0.0,device=input_ids.device)
-        for _kp in (p for pg in opt_g.param_groups for p in pg['params']):
-            _fid=id(_kp)
-            if _fid in model._fisher_diag and _fid in model._fisher_ref:
-                _d=_kp-model._fisher_ref[_fid]
-                _dr=_d.real if _kp.is_complex() else _d
-                _L_KL=_L_KL+(model._fisher_diag[_fid]*_dr.pow(2)).sum()
+        for _name,_kp in model.named_parameters():
+            if _name in model._fisher_diag_named and _name in model._fisher_ref_named:
+                _d=_kp-model._fisher_ref_named[_name]
+                if _kp.is_complex():
+                    # penalise both real and imaginary displacement
+                    _L_KL=_L_KL+(model._fisher_diag_named[_name]*(_d.real.pow(2)+_d.imag.pow(2))).sum()
+                else:
+                    _L_KL=_L_KL+(model._fisher_diag_named[_name]*_d.pow(2)).sum()
         L_pass1=L_pass1+_kl_w*_L_KL
-
-    # DEBUG: check L_null separately
-    if _null_raw is not None and _null_raw.requires_grad:
-        _dbg_check('_null_aux_loss (via L_null)', L_null)
 
     # SE-2 MDLM masking (§1.44): stash params for a separate backward AFTER L_pass1
     _mdlm_mid=None
@@ -399,53 +384,85 @@ def train_step_v605(batch, model, opts, si, phase, step,
         _ti=model.encoder.titans
         for _layer in model.cfl_layers: _layer._W_ll_cache.clear()
         model.sti_head.reset()
-        # Save all model state that the MDLM forward mutates in-place
+        # Snapshot n_l BEFORE the forward so save/restore slices stay consistent
+        # even if spawn/prune fires during the MDLM forward.
+        _nl=model.bank.n_l
         _saved_pos          = getattr(model,'_pos_offset',0)
-        _saved_rho          = model.bank.rho_l[:model.bank.n_l].clone()
-        _saved_h_c          = model.bank.h_c_l[:model.bank.n_l].clone()
+        _saved_rho          = model.bank.rho_l[:_nl].clone()
+        _saved_h_c          = model.bank.h_c_l[:_nl].clone()
+        _saved_H_c          = model.bank.H_c_l[:_nl].clone()
         _saved_prev_sel     = model.bank._prev_sel_l
         _saved_bridge_info  = getattr(model,'_last_bridge_info',None)
         _saved_titans_M     = _ti.M.clone()
         _saved_titans_accum = list(_ti._chunk_accum)
         _saved_titans_prev  = _ti._prev_e_c.clone()
         _saved_titans_hasp  = _ti._has_prev
-        _lm,_,_=model(_mdlm_mid,training=False)
-        # Restore — MDLM forward must not alter state seen by the next real step
-        model._pos_offset                    = _saved_pos
-        model.bank.rho_l[:model.bank.n_l]   = _saved_rho
-        model.bank.h_c_l[:model.bank.n_l]   = _saved_h_c
-        model.bank._prev_sel_l               = _saved_prev_sel
-        model._last_bridge_info              = _saved_bridge_info
-        _ti.M.copy_(_saved_titans_M)
-        _ti._chunk_accum                     = _saved_titans_accum
-        _ti._prev_e_c.copy_(_saved_titans_prev)
-        _ti._has_prev                        = _saved_titans_hasp
-        _tgtm=input_ids.reshape(-1).clone(); _tgtm[~_mpos.reshape(-1)]=-100
-        _Lmlm=cfg.get('lambda_mlm',0.3)*F.cross_entropy(
-            _lm.reshape(-1,_lm.size(-1)),_tgtm,ignore_index=-100)
-        _Lmlm.backward()
+        _saved_r_lista      = model.diff_aux.cun.r_lista.detach().clone()
+        _saved_g_c          = model.bank.g_c.clone()
+        _saved_in_hypo      = model.bank._in_hypo_mode
+        _saved_r_lista_hypo = model.bank._r_lista_hypo
+        _saved_goal_frozen  = model.bank._goal_frozen
+        # VQ / Welford state — not restored in original code; MDLM masked-input contaminates them
+        _saved_L1_ptr         = model.bank._L1_ptr
+        _saved_last_E_min_raw = getattr(model.bank, '_last_E_min_raw', None)
+        _saved_arc_n_filled   = model.surprise_archive._n_filled
+        _saved_arc_vq_ptrs    = list(getattr(model.surprise_archive, '_vq_ptrs', []))
+        _saved_arc_vq_scores  = list(getattr(model.surprise_archive, '_vq_scores', []))
+        try:
+            _lm,_,_=model(_mdlm_mid,training=False)
+            _tgtm=input_ids.reshape(-1).clone(); _tgtm[~_mpos.reshape(-1)]=-100
+            _Lmlm=cfg.get('lambda_mlm',0.3)*F.cross_entropy(
+                _lm.reshape(-1,_lm.size(-1)),_tgtm,ignore_index=-100)
+            _Lmlm.backward()
+        finally:
+            # Restore — always runs even if forward or backward raises.
+            # Use pre-saved _nl to avoid slice mismatch if n_l changed.
+            model._pos_offset                    = _saved_pos
+            model.bank.rho_l[:_nl]               = _saved_rho
+            model.bank.h_c_l[:_nl]               = _saved_h_c
+            model.bank.H_c_l[:_nl]               = _saved_H_c
+            model.bank._prev_sel_l               = _saved_prev_sel
+            model._last_bridge_info              = _saved_bridge_info
+            _ti.M.copy_(_saved_titans_M)
+            _ti._chunk_accum                     = _saved_titans_accum
+            _ti._prev_e_c.copy_(_saved_titans_prev)
+            _ti._has_prev                        = _saved_titans_hasp
+            model.diff_aux.cun.r_lista.copy_(_saved_r_lista)
+            model.bank.g_c.copy_(_saved_g_c)
+            model.bank._in_hypo_mode             = _saved_in_hypo
+            model.bank._r_lista_hypo             = _saved_r_lista_hypo
+            model.bank._goal_frozen              = _saved_goal_frozen
+            # Restore VQ / Welford state contaminated by MDLM masked-input forward
+            model.bank._L1_ptr                        = _saved_L1_ptr
+            if _saved_last_E_min_raw is not None:
+                model.bank._last_E_min_raw            = _saved_last_E_min_raw
+            model.surprise_archive._n_filled          = _saved_arc_n_filled
+            model.surprise_archive._vq_ptrs           = _saved_arc_vq_ptrs
+            model.surprise_archive._vq_scores         = _saved_arc_vq_scores
     # Nullify all cross-step live-graph attributes AFTER every backward in this step.
-    # The MDLM forward re-populates these (titans._null_aux_loss, _last_L_bridge, etc.)
-    # with fresh MDLM-graph tensors. _Lmlm.backward() frees that graph, leaving stale
-    # grad_fn pointers. Step N+1 reads them before its own forward runs → crash.
-    # Nullifying here ensures step N+1 always sees None and waits for its own forward.
+    # The MDLM forward re-populates these with fresh MDLM-graph tensors; backward
+    # frees that graph leaving stale grad_fn pointers. Step N+1 always sees None.
     model.encoder.titans._null_aux_loss=None
     model.diff_aux.cun._last_beam_diversity=None
     model._last_L_bridge=None
     model.bank._last_L_vq=None
+    model._L_compress_accum=None
 
-    # Accumulate Fisher diagonal (§1.57) — after backward, before clip
-    if not hasattr(model,'_fisher_diag'): model._fisher_diag={}; model._fisher_ref={}
-    _stiefel_ids={id(model.bank.W_l),id(model.bank.W_p)}
-    for _kp in (p for pg in opt_g.param_groups for p in pg['params']):
-        if id(_kp) in _stiefel_ids or _kp.grad is None: continue
+    # Accumulate Fisher diagonal (§1.57) — after backward, before clip.
+    # _fisher_diag_named: name-keyed EMA used by Fisher-KL penalty (survives checkpoint reload).
+    # _fisher_diag: id-keyed EMA used by update_fisher_magnitude_freeze (W_l special case).
+    if not hasattr(model,'_fisher_diag'): model._fisher_diag={}
+    if not hasattr(model,'_fisher_diag_named'): model._fisher_diag_named={}; model._fisher_ref_named={}
+    _stiefel_names={'bank.W_l','bank.W_p'}
+    for _name,_kp in model.named_parameters():
+        if _name in _stiefel_names or _kp.grad is None: continue
         _gr=_kp.grad.real if _kp.is_complex() else _kp.grad
         _f2=(_gr.detach()**2)
-        _fid=id(_kp)
-        if _fid not in model._fisher_diag:
-            model._fisher_diag[_fid]=_f2.clone(); model._fisher_ref[_fid]=_kp.detach().clone()
+        if _name not in model._fisher_diag_named:
+            model._fisher_diag_named[_name]=_f2.clone(); model._fisher_ref_named[_name]=_kp.detach().clone()
         else:
-            model._fisher_diag[_fid].mul_(0.99).add_(_f2,alpha=0.01)
+            model._fisher_diag_named[_name].mul_(0.99).add_(_f2,alpha=0.01)
+            model._fisher_ref_named[_name]=_kp.detach().clone()
 
     # §1.63: accumulate W_l per-unit scalar Fisher (W_l excluded from AdamW loop above)
     if model.bank.W_l.grad is not None:
@@ -494,7 +511,7 @@ def train_step_v605(batch, model, opts, si, phase, step,
         L_diff=model.diff_aux(x_out,training=True)
         L_lista=model.refine.compute_lista_loss(xm,x_out)
         L_pass2=L_diff+cfg.get('lambda_lista',0.1)*L_lista
-        muon_diff.zero_grad(); opt_g.zero_grad(); opt_u.zero_grad()
+        muon_diff.zero_grad(); opt_g.zero_grad(); opt_u.zero_grad(); opt_p.zero_grad()
         L_pass2.backward()
         torch.nn.utils.clip_grad_norm_(
             [p for pg in opt_g.param_groups for p in pg['params'] if p.grad is not None],

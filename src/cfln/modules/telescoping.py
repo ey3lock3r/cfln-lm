@@ -109,10 +109,20 @@ class TelescopingMemory:
         self._accum_L2 = []; self._accum_L3 = []
         self._pending_L2 = None; self._pending_L3 = None
 
+    def _apply(self, fn):
+        self.buf_L1 = fn(self.buf_L1)
+        self.buf_L2 = fn(self.buf_L2)
+        self.buf_L3 = fn(self.buf_L3)
+        if self._pending_L2 is not None: self._pending_L2 = fn(self._pending_L2)
+        if self._pending_L3 is not None: self._pending_L3 = fn(self._pending_L3)
+        return self
+
     def to(self, device):
         self.buf_L1 = self.buf_L1.to(device)
         self.buf_L2 = self.buf_L2.to(device)
         self.buf_L3 = self.buf_L3.to(device)
+        if self._pending_L2 is not None: self._pending_L2 = self._pending_L2.to(device)
+        if self._pending_L3 is not None: self._pending_L3 = self._pending_L3.to(device)
         return self
 
     @torch.no_grad()

@@ -135,15 +135,18 @@ def apply_psd_to_weight_matrix(W, eps=1e-6):
 
 
 def batched_apply_psd(W_list: list, eps: float=1e-6) -> list:
-    """v6.0.7 PF-2: batch eigh across L layer W_ll matrices for 4-6× GPU speedup.
+    """v6.0.7 PF-2: batch SVD across L layer W_ll matrices for GPU stability.
+    Uses SVD (not eigh): cuSOLVER eigh fails with error code 5 on near-rank-1
+    matrices in both float32 and float64. SVD never fails on degenerate matrices.
     W_list: list of L (k_l,k_l) float tensors.
     Returns: list of L PSD-projected tensors (same shapes)."""
     if not W_list:
         return W_list
-    W_stack = torch.stack([w.float() for w in W_list])           # (L, k_l, k_l)
-    W_sym   = (W_stack + W_stack.transpose(-1,-2)) * 0.5         # enforce symmetry
-    ev, evec = torch.linalg.eigh(W_sym)                          # (L, k_l), (L, k_l, k_l)
-    W_psd   = (evec * ev.clamp(eps).unsqueeze(-2)) @ evec.transpose(-1,-2)  # (L, k_l, k_l)
+    W_stack  = torch.stack([w.float() for w in W_list])           # (L, k_l, k_l)
+    W_sym    = (W_stack + W_stack.transpose(-1,-2)) * 0.5         # enforce symmetry
+    W_double = W_sym.double()
+    U, S, _  = torch.linalg.svd(W_double)                         # (L,k,k), (L,k), _
+    W_psd    = (U * S.clamp(eps).unsqueeze(-2)) @ U.transpose(-1,-2)  # (L, k_l, k_l)
     return [W_psd[i].to(W_list[i].dtype) for i in range(len(W_list))]
 
 
@@ -182,14 +185,6 @@ def stiefel_update_all_v51(bank, lr_l=0.001, lr_p=0.0001):
     if lr_p>0 and bank.W_p.grad is not None:
         bank.W_p.data.copy_(batched_cayley_retraction(bank.W_p.data,bank.W_p.grad,lr_p))
         bank.W_p.grad=None
-
-
-def stiefel_update_cun(diff_aux, lr):
-    for W in [diff_aux.cun.U1, diff_aux.cun.U2]:
-        if W.grad is not None:
-            torch.nn.utils.clip_grad_norm_([W], 1.0)  # U1/U2 not in opt_g clip
-            W.data.copy_(cayley_retraction_single(W.data, W.grad, lr))
-            W.grad=None
 
 
 def hippo_legs_init(d_ssm):

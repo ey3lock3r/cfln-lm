@@ -166,7 +166,7 @@ class CFBank(nn.Module):
 
     def _apply(self, fn):
         super()._apply(fn)
-        self.coact_register.to(self.mu_c_l.device)
+        self.coact_register._apply(fn)
         return self
 
     def compute_u_epistemic(self, E_l: 'torch.Tensor', s_l: 'torch.Tensor',
