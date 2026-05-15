@@ -373,13 +373,6 @@ def train_step_v605(batch, model, opts, si, phase, step,
             _mdlm_mid=input_ids.clone(); _mdlm_mid[_mpos]=cfg.get('mask_token_id',1)
 
     opt_g.zero_grad(); muon.zero_grad(); L_pass1.backward()
-    # Nullify all cross-step live-graph attributes so next step's forward writes fresh ones.
-    # These tensors were consumed into L_pass1; keeping them would cause "backward through
-    # freed graph" on step 2+ when the next step reads them before its own forward runs.
-    model.encoder.titans._null_aux_loss=None
-    model.diff_aux.cun._last_beam_diversity=None
-    model._last_L_bridge=None
-    model.bank._last_L_vq=None
     # L_pass1 graph is now freed. MDLM forward is built on a clean slate — no shared nodes.
     if _mdlm_mid is not None:
         _ti=model.encoder.titans
@@ -410,6 +403,15 @@ def train_step_v605(batch, model, opts, si, phase, step,
         _Lmlm=cfg.get('lambda_mlm',0.3)*F.cross_entropy(
             _lm.reshape(-1,_lm.size(-1)),_tgtm,ignore_index=-100)
         _Lmlm.backward()
+    # Nullify all cross-step live-graph attributes AFTER every backward in this step.
+    # The MDLM forward re-populates these (titans._null_aux_loss, _last_L_bridge, etc.)
+    # with fresh MDLM-graph tensors. _Lmlm.backward() frees that graph, leaving stale
+    # grad_fn pointers. Step N+1 reads them before its own forward runs → crash.
+    # Nullifying here ensures step N+1 always sees None and waits for its own forward.
+    model.encoder.titans._null_aux_loss=None
+    model.diff_aux.cun._last_beam_diversity=None
+    model._last_L_bridge=None
+    model.bank._last_L_vq=None
 
     # Accumulate Fisher diagonal (§1.57) — after backward, before clip
     if not hasattr(model,'_fisher_diag'): model._fisher_diag={}; model._fisher_ref={}
