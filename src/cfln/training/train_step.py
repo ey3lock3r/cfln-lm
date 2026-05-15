@@ -375,17 +375,30 @@ def train_step_v605(batch, model, opts, si, phase, step,
     opt_g.zero_grad(); muon.zero_grad(); L_pass1.backward()
     # L_pass1 graph is now freed. MDLM forward is built on a clean slate — no shared nodes.
     if _mdlm_mid is not None:
+        _ti=model.encoder.titans
         for _layer in model.cfl_layers: _layer._W_ll_cache.clear()
         model.sti_head.reset()
-        _saved_pos=getattr(model,'_pos_offset',0)
-        _saved_rho=model.bank.rho_l[:model.bank.n_l].clone()
-        _saved_h_c=model.bank.h_c_l[:model.bank.n_l].clone()
-        _saved_prev_sel=model.bank._prev_sel_l
+        # Save all model state that the MDLM forward mutates in-place
+        _saved_pos          = getattr(model,'_pos_offset',0)
+        _saved_rho          = model.bank.rho_l[:model.bank.n_l].clone()
+        _saved_h_c          = model.bank.h_c_l[:model.bank.n_l].clone()
+        _saved_prev_sel     = model.bank._prev_sel_l
+        _saved_bridge_info  = getattr(model,'_last_bridge_info',None)
+        _saved_titans_M     = _ti.M.clone()
+        _saved_titans_accum = list(_ti._chunk_accum)
+        _saved_titans_prev  = _ti._prev_e_c.clone()
+        _saved_titans_hasp  = _ti._has_prev
         _lm,_,_=model(_mdlm_mid,training=False)
-        model._pos_offset=_saved_pos
-        model.bank.rho_l[:model.bank.n_l]=_saved_rho
-        model.bank.h_c_l[:model.bank.n_l]=_saved_h_c
-        model.bank._prev_sel_l=_saved_prev_sel
+        # Restore — MDLM forward must not alter state seen by the next real step
+        model._pos_offset                    = _saved_pos
+        model.bank.rho_l[:model.bank.n_l]   = _saved_rho
+        model.bank.h_c_l[:model.bank.n_l]   = _saved_h_c
+        model.bank._prev_sel_l               = _saved_prev_sel
+        model._last_bridge_info              = _saved_bridge_info
+        _ti.M.copy_(_saved_titans_M)
+        _ti._chunk_accum                     = _saved_titans_accum
+        _ti._prev_e_c.copy_(_saved_titans_prev)
+        _ti._has_prev                        = _saved_titans_hasp
         _tgtm=input_ids.reshape(-1).clone(); _tgtm[~_mpos.reshape(-1)]=-100
         _Lmlm=cfg.get('lambda_mlm',0.3)*F.cross_entropy(
             _lm.reshape(-1,_lm.size(-1)),_tgtm,ignore_index=-100)
