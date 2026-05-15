@@ -364,32 +364,32 @@ def train_step_v605(batch, model, opts, si, phase, step,
                 _L_KL=_L_KL+(model._fisher_diag[_fid]*_dr.pow(2)).sum()
         L_pass1=L_pass1+_kl_w*_L_KL
 
-    # SE-2 MDLM masking (stage 0 only, §1.44)
+    # SE-2 MDLM masking (§1.44): stash params for a separate backward AFTER L_pass1
+    _mdlm_mid=None
     if stage==0 and cfg.get('p_mask',0.0)>0.0:
-        _pm=cfg.get('p_mask',0.15); _mtok=cfg.get('mask_token_id',1)
+        _pm=cfg.get('p_mask',0.15)
         _mpos=torch.bernoulli(torch.full((B,T),_pm,device=input_ids.device)).bool()
         if _mpos.any():
-            _mid=input_ids.clone(); _mid[_mpos]=_mtok
-            # Isolate second forward from first-forward graph nodes.
-            # _W_ll_cache and sti_head._ocn_hist hold live grad_fn nodes; reusing
-            # them causes "backward through graph twice". Save/restore positional
-            # and routing state so the MDLM forward leaves no side-effects.
-            for _layer in model.cfl_layers: _layer._W_ll_cache.clear()
-            model.sti_head.reset()
-            _saved_pos=getattr(model,'_pos_offset',0)
-            _saved_rho=model.bank.rho_l[:model.bank.n_l].clone()
-            _saved_h_c=model.bank.h_c_l[:model.bank.n_l].clone()
-            _saved_prev_sel=model.bank._prev_sel_l
-            _lm,_,_=model(_mid,training=False)
-            model._pos_offset=_saved_pos
-            model.bank.rho_l[:model.bank.n_l]=_saved_rho
-            model.bank.h_c_l[:model.bank.n_l]=_saved_h_c
-            model.bank._prev_sel_l=_saved_prev_sel
-            _tgtm=input_ids.reshape(-1).clone(); _tgtm[~_mpos.reshape(-1)]=-100
-            _Lmlm=F.cross_entropy(_lm.reshape(-1,_lm.size(-1)),_tgtm,ignore_index=-100)
-            L_pass1=L_pass1+cfg.get('lambda_mlm',0.3)*_Lmlm
+            _mdlm_mid=input_ids.clone(); _mdlm_mid[_mpos]=cfg.get('mask_token_id',1)
 
     opt_g.zero_grad(); muon.zero_grad(); L_pass1.backward()
+    # L_pass1 graph is now freed. MDLM forward is built on a clean slate — no shared nodes.
+    if _mdlm_mid is not None:
+        for _layer in model.cfl_layers: _layer._W_ll_cache.clear()
+        model.sti_head.reset()
+        _saved_pos=getattr(model,'_pos_offset',0)
+        _saved_rho=model.bank.rho_l[:model.bank.n_l].clone()
+        _saved_h_c=model.bank.h_c_l[:model.bank.n_l].clone()
+        _saved_prev_sel=model.bank._prev_sel_l
+        _lm,_,_=model(_mdlm_mid,training=False)
+        model._pos_offset=_saved_pos
+        model.bank.rho_l[:model.bank.n_l]=_saved_rho
+        model.bank.h_c_l[:model.bank.n_l]=_saved_h_c
+        model.bank._prev_sel_l=_saved_prev_sel
+        _tgtm=input_ids.reshape(-1).clone(); _tgtm[~_mpos.reshape(-1)]=-100
+        _Lmlm=cfg.get('lambda_mlm',0.3)*F.cross_entropy(
+            _lm.reshape(-1,_lm.size(-1)),_tgtm,ignore_index=-100)
+        _Lmlm.backward()
 
     # Accumulate Fisher diagonal (§1.57) — after backward, before clip
     if not hasattr(model,'_fisher_diag'): model._fisher_diag={}; model._fisher_ref={}
