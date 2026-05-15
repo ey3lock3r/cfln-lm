@@ -450,7 +450,8 @@ def train_step_v605(batch, model, opts, si, phase, step,
 
     # Accumulate Fisher diagonal (§1.57) — after backward, before clip.
     # _fisher_diag_named: name-keyed EMA used by Fisher-KL penalty (survives checkpoint reload).
-    # _fisher_diag: id-keyed EMA used by update_fisher_magnitude_freeze (W_l special case).
+    # _fisher_diag: id-keyed EMA used by update_fisher_magnitude_freeze (W_l special case)
+    #               and as a general presence indicator (len > 0 ↔ Fisher is live).
     if not hasattr(model,'_fisher_diag'): model._fisher_diag={}
     if not hasattr(model,'_fisher_diag_named'): model._fisher_diag_named={}; model._fisher_ref_named={}
     _stiefel_names={'bank.W_l','bank.W_p'}
@@ -458,6 +459,13 @@ def train_step_v605(batch, model, opts, si, phase, step,
         if _name in _stiefel_names or _kp.grad is None: continue
         _gr=_kp.grad.real if _kp.is_complex() else _kp.grad
         _f2=(_gr.detach()**2)
+        # id-keyed (general params): kept for legacy presence checks
+        _kid=id(_kp)
+        if _kid not in model._fisher_diag:
+            model._fisher_diag[_kid]=_f2.clone()
+        else:
+            model._fisher_diag[_kid].mul_(0.99).add_(_f2,alpha=0.01)
+        # name-keyed: survives checkpoint reload, used by Fisher-KL penalty
         if _name not in model._fisher_diag_named:
             model._fisher_diag_named[_name]=_f2.clone(); model._fisher_ref_named[_name]=_kp.detach().clone()
         else:
