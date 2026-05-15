@@ -32,9 +32,11 @@ class DynamicLocalBank:
         self.n_active+=1; bk.n_l=self.n_active; return idx
 
     def prune(self,keep_idx: torch.Tensor,dormancy=None,si=None):
-        bk=self.bank; n=bk.n_l; sens=bk.is_sensory_l[:n]; si_idx=sens.nonzero(as_tuple=True)[0]
+        bk=self.bank; n=bk.n_l; dev=bk.is_sensory_l.device
+        sens=bk.is_sensory_l[:n]; si_idx=sens.nonzero(as_tuple=True)[0]
+        keep_idx=keep_idx.to(dev)
         all_keep=torch.unique(torch.cat([keep_idx,si_idx]))
-        pruned=torch.ones(n,dtype=torch.bool); pruned[all_keep]=False
+        pruned=torch.ones(n,dtype=torch.bool,device=dev); pruned[all_keep]=False
         if dormancy is not None:
             for idx in (pruned&~sens).nonzero(as_tuple=True)[0].tolist():
                 dormancy.add_from_history(bk,idx)

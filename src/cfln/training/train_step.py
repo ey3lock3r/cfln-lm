@@ -112,7 +112,7 @@ def memory_update_v605(bank, dyn, dormancy, x_c, s_l, a_l_rq,
     ops['new_sensory']=bank.update_sensory_mask(cfg.get('sensory_fraction',0.15))
     alpha=torch.exp(bank.log_alp_l[:n]).clamp(1e-6,1.0); rq=a_l_rq.mean(0)[:n]
     sens=bank.is_sensory_l[:n]
-    h_var=(bank.H_c_l[:n].abs().var(dim=-1).mean(-1) if bank.H_c_l is not None else torch.zeros(n))
+    h_var=(bank.H_c_l[:n].abs().var(dim=-1).mean(-1) if bank.H_c_l is not None else torch.zeros(n,device=bank.is_sensory_l.device))
     keep=((sens)|(alpha>eps_p)|(rq>eps_p)|(h_var>eps_H))
     ki=keep.nonzero(as_tuple=True)[0]
     if len(ki)<n:
