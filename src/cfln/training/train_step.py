@@ -372,13 +372,19 @@ def train_step_v605(batch, model, opts, si, phase, step,
             _mid=input_ids.clone(); _mid[_mpos]=_mtok
             # Isolate second forward from first-forward graph nodes.
             # _W_ll_cache and sti_head._ocn_hist hold live grad_fn nodes; reusing
-            # them causes "backward through graph twice". Save/restore _pos_offset
-            # so the inference-mode advance does not corrupt positional encodings.
+            # them causes "backward through graph twice". Save/restore positional
+            # and routing state so the MDLM forward leaves no side-effects.
             for _layer in model.cfl_layers: _layer._W_ll_cache.clear()
             model.sti_head.reset()
             _saved_pos=getattr(model,'_pos_offset',0)
+            _saved_rho=model.bank.rho_l[:model.bank.n_l].clone()
+            _saved_h_c=model.bank.h_c_l[:model.bank.n_l].clone()
+            _saved_prev_sel=model.bank._prev_sel_l
             _lm,_,_=model(_mid,training=False)
             model._pos_offset=_saved_pos
+            model.bank.rho_l[:model.bank.n_l]=_saved_rho
+            model.bank.h_c_l[:model.bank.n_l]=_saved_h_c
+            model.bank._prev_sel_l=_saved_prev_sel
             _tgtm=input_ids.reshape(-1).clone(); _tgtm[~_mpos.reshape(-1)]=-100
             _Lmlm=F.cross_entropy(_lm.reshape(-1,_lm.size(-1)),_tgtm,ignore_index=-100)
             L_pass1=L_pass1+cfg.get('lambda_mlm',0.3)*_Lmlm
